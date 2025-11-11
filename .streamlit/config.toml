@@ -1,0 +1,15 @@
+[client]
+showSidebarNavigation = true
+toolbarMode = "minimal"
+
+[ui]
+hideTopBar = true
+
+[logger]
+level="error"
+
+[server]
+enableStaticServing = true
+
+[theme]
+base="light"
