@@ -1,0 +1,28 @@
+# Web Framework
+streamlit==1.45.0
+
+# Data Processing and Analysis
+pandas==2.2.2
+numpy==1.26.4
+
+# Visualization
+plotly==6.0.1
+molview
+
+# HTTP Requests
+requests==2.32.3
+
+# Configuration and Data Serialization
+PyYAML==6.0.2
+
+# Machine Learning and Inference
+onnxruntime==1.20.1
+
+# Chemistry and Drug Discovery
+rdkit
+
+# ChEMBL Web Services
+chembl-webresource-client
+
+# Boltz2 (using 2.0.3 to avoid cuequivariance_ops GPU compatibility issues)
+boltz[cuda]==2.0.3
