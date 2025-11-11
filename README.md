@@ -1,7 +1,7 @@
-# BoltzOmics
-
+![BoltzOmics](https://github.com/k-ngo/boltzomics/blob/main/images/boltzomics.png?raw=true)
 BoltzOmics is an interactive platform for deep learning-driven pharmacogenomic analysis. It leverages the Boltz-2 structure prediction model to assess how genetic mutations affect drug binding. Designed as a standalone Streamlit application, it offers an end-to-end solution for researchers in computational biology, pharmacology, and precision medicine, enabling the study of mutation effects on protein-ligand interactions.
 
+![GUI](https://github.com/k-ngo/boltzomics/blob/main/images/gui.png?raw=true)
 ---
 
 ## Key Features
