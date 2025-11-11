@@ -31,7 +31,7 @@ To set up and run BoltzOmics, follow these steps:
 
 ### 1. Clone the Repository
 
-First, clone this GitHub repository to your local machine:
+First, clone this GitHub repository to your local machine by typing the following commands in the terminal:
 
 ```bash
 git clone https://github.com/k-ngo/boltzomics.git
@@ -40,7 +40,7 @@ cd boltzomics
 
 ### 2. Create and Activate Conda Environment
 
-Create a new Conda environment named `boltz-omics` and activate it:
+In the terminal, create a new Conda environment and activate it:
 
 ```bash
 conda create -n boltzomics python=3.12 -y
@@ -49,7 +49,7 @@ conda activate boltzomics
 
 ### 3. Install Dependencies
 
-Install the required Python packages using `pip` and the `requirements.txt` file:
+Install the required Python packages:
 
 ```bash
 pip install -r requirements.txt
@@ -63,7 +63,7 @@ Once all dependencies are installed, you can launch the Streamlit application:
 streamlit run boltzomics.py
 ```
 
-This command will open the application in your web browser. If the browser does not automatically open or if running on a remote machine (e.g. through SSH connection), the Streamlit server will provide a URL (e.g., `http://localhost:8501` or an external IP address) that you can access from your local machine to interact with the application.
+This command will open the application in your web browser. If the browser does not automatically open or if running on a remote machine (e.g. through SSH connection), the Streamlit server will provide a URL (e.g., `http://localhost:8501` or an external IP address) that you can access from the web browser of your local machine to interact with the application.
 
 ---
 
