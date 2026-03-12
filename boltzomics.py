@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import time
 import json
+import hashlib
+import logging
 from datetime import datetime
 import os
 import yaml
@@ -18,6 +20,14 @@ from tempfile import NamedTemporaryFile
 import copy
 from collections import OrderedDict
 import uuid
+import subprocess
+import sys
+
+logger = logging.getLogger(__name__)
+
+MODULES_DIR = os.path.join(os.path.dirname(__file__), "boltzomics_lib")
+if MODULES_DIR not in sys.path:
+    sys.path.insert(0, MODULES_DIR)
 
 
 try:
@@ -32,6 +42,70 @@ try:
 except ImportError:
     ScreeningJobManager = None
     ScreeningJob = None
+
+try:
+    from msa_cache import MSACache, get_msa_cache, should_use_msa_cache
+except ImportError:
+    MSACache = None
+    get_msa_cache = None
+    should_use_msa_cache = None
+
+try:
+    from pharmacogenomic_analysis import (
+        PharmacogenomicAnalyzer,
+        MutationEffect,
+        ConfidenceLevel,
+        analyze_screening_results,
+        quick_delta_analysis
+    )
+except ImportError:
+    PharmacogenomicAnalyzer = None
+    MutationEffect = None
+    ConfidenceLevel = None
+    analyze_screening_results = None
+    quick_delta_analysis = None
+
+try:
+    from structure_refinement import (
+        quick_interface_check,
+        compare_wt_mutant_quick,
+        analyze_binding_interface,
+        generate_interaction_fingerprint,
+        refine_and_analyze,
+        check_openmm_available
+    )
+except ImportError:
+    quick_interface_check = None
+    compare_wt_mutant_quick = None
+    analyze_binding_interface = None
+    generate_interaction_fingerprint = None
+    refine_and_analyze = None
+    check_openmm_available = None
+
+try:
+    from mutation_analysis import (
+        analyze_mutation_impact,
+        analyze_mutation_properties,
+        analyze_binding_proximity,
+        quick_proximity_check,
+        quick_property_check
+    )
+except ImportError:
+    analyze_mutation_impact = None
+    analyze_mutation_properties = None
+    analyze_binding_proximity = None
+    quick_proximity_check = None
+    quick_property_check = None
+
+try:
+    from mutation_local_consistency import annotate_results_with_mutation_local_consistency
+except ImportError:
+    annotate_results_with_mutation_local_consistency = None
+
+try:
+    from affinity_multisampling import run_affinity_multisampling
+except ImportError:
+    run_affinity_multisampling = None
 
 try:
     import styles
@@ -125,10 +199,551 @@ def _format_duration(seconds: Optional[float]) -> Optional[str]:
         parts.append(f"{secs}s")
     return " ".join(parts)
 
+
+def _normalize_for_hash(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _normalize_for_hash(value[k]) for k in sorted(value)}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_for_hash(v) for v in value]
+    if isinstance(value, set):
+        normalized = [_normalize_for_hash(v) for v in value]
+        return sorted(normalized, key=lambda item: json.dumps(item, sort_keys=True))
+    return value
+
+
+def _is_wt_name(name: str) -> bool:
+    upper = str(name).strip().upper()
+    return (
+        upper in {"WT", "WILDTYPE", "WILD_TYPE"}
+        or upper.endswith("_WT")
+        or upper.endswith("-WT")
+    )
+
+
+def _extract_mutation_positions_from_label(label: str) -> List[int]:
+    """
+    Parse residue indices from mutation labels (e.g., "K262R", "Y652A-F656A").
+    """
+    if not label:
+        return []
+    if _is_wt_name(label):
+        return []
+    matches = re.findall(r"[A-Za-z\*](\d+)[A-Za-z\*]", str(label))
+    out: List[int] = []
+    for token in matches:
+        try:
+            value = int(token)
+        except (TypeError, ValueError):
+            continue
+        if value > 0 and value not in out:
+            out.append(value)
+    return out
+
+
+def _order_protein_sequences_for_screening(
+    protein_sequences: List[Tuple[str, str]]
+) -> List[Tuple[str, str]]:
+    """
+    Keep input order but move WT-like entries first.
+    """
+    indexed = list(enumerate(protein_sequences))
+    indexed.sort(key=lambda item: (0 if _is_wt_name(item[1][0]) else 1, item[0]))
+    return [entry for _, entry in indexed]
+
+
+def _parse_positive_int_list_from_text(raw_text: str) -> List[int]:
+    if not raw_text:
+        return []
+    tokens = re.split(r"[\s,;]+", str(raw_text).strip())
+    out: List[int] = []
+    for token in tokens:
+        t = token.strip()
+        if not t:
+            continue
+        try:
+            value = int(t)
+        except ValueError:
+            continue
+        if value < 1:
+            continue
+        if value not in out:
+            out.append(value)
+    return out
+
+
+def _parse_affinity_multisampling_profiles_from_text(
+    raw_text: str,
+    default_diffusion_samples: int,
+) -> List[Dict[str, int]]:
+    if not raw_text:
+        return []
+    tokens = re.split(r"[\s,;]+", str(raw_text).strip())
+    out: List[Dict[str, int]] = []
+    seen: set = set()
+    base_diff = max(1, int(default_diffusion_samples))
+    for token in tokens:
+        t = str(token).strip()
+        if not t:
+            continue
+        parts = re.split(r"[:/xX]", t, maxsplit=1)
+        try:
+            step = int(parts[0].strip())
+        except (TypeError, ValueError):
+            continue
+        if step < 1:
+            continue
+        diff = base_diff
+        if len(parts) > 1 and parts[1].strip():
+            try:
+                diff = int(parts[1].strip())
+            except (TypeError, ValueError):
+                continue
+        if diff < 1:
+            continue
+        key = (int(step), int(diff))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "sampling_steps_affinity": int(step),
+                "diffusion_samples_affinity": int(diff),
+            }
+        )
+    return out
+
+
+def _auto_diffusion_samples_for_affinity_step(step: int) -> int:
+    # Anchor to historical presets: 200->5, 300->7, 400->9.
+    return max(1, int(round(5.0 + (float(step) - 200.0) / 50.0)))
+
+
+def _prediction_reproducibility_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Select only prediction-relevant parameters for stable job/output identifiers.
+    """
+    relevant_keys = [
+        "recycling_steps",
+        "sampling_steps",
+        "diffusion_samples",
+        "max_parallel_samples",
+        "step_scale",
+        "affinity_mw_correction",
+        "affinity_consensus_enabled",
+        "affinity_consensus_mode",
+        "affinity_consensus_weight_floor",
+        "affinity_consensus_entropy_alpha",
+        "affinity_multisampling_enabled",
+        "affinity_multisampling_profiles",
+        "affinity_multisampling_settings",
+        "affinity_multisampling_refinement_steps",
+        "affinity_multisampling_aggregate_mode",
+        "affinity_multisampling_apply_aggregate",
+        "affinity_multisampling_early_stop_enabled",
+        "affinity_multisampling_early_stop_min_points",
+        "affinity_multisampling_early_stop_delta",
+        "affinity_multisampling_early_stop_std",
+        "affinity_multisampling_early_stop_patience",
+        "affinity_multisampling_robust_outlier_filter",
+        "affinity_multisampling_robust_outlier_zmax",
+        "affinity_multisampling_bootstrap_samples",
+        "external_boltz_patch_enabled",
+        "external_boltz_patch_mode",
+        "external_boltz_patch_weight_floor",
+        "external_boltz_patch_entropy_alpha",
+        "external_boltz_patch_uncertainty_penalty",
+        "external_boltz_patch_min_confidence",
+        "max_msa_seqs",
+        "sampling_steps_affinity",
+        "diffusion_samples_affinity",
+        "subsample_msa",
+        "num_subsampled_msa",
+        "use_potentials",
+        "method",
+        "mutation_steering_config",
+        "template_cif_path",
+        "binding_pocket_constraints",
+        "cofactor_info",
+        "ptm_modifications",
+        "structure_only",
+    ]
+    selected: Dict[str, Any] = {}
+    for key in relevant_keys:
+        if key in params:
+            selected[key] = params.get(key)
+    return selected
+
+
+def _derive_stable_job_identifiers(
+    project_name: str,
+    protein_name: str,
+    protein_sequence: str,
+    drug_name: str,
+    smiles: str,
+    structure_only: bool,
+    params: Dict[str, Any],
+) -> Tuple[str, str, str]:
+    """
+    Build deterministic identifiers for workspace, design, and queue job id.
+    """
+    design_name = _sanitize_design_name(protein_name, None if structure_only else drug_name)
+    signature_payload = {
+        "project_name": project_name,
+        "protein_name": protein_name,
+        "protein_sequence": protein_sequence,
+        "drug_name": "" if structure_only else drug_name,
+        "smiles": "" if structure_only else smiles,
+        "design_name": design_name,
+        "params": _prediction_reproducibility_params(params),
+    }
+    normalized = _normalize_for_hash(signature_payload)
+    signature_raw = json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    digest = hashlib.sha1(signature_raw.encode("utf-8")).hexdigest()
+    workspace_name = f"screening_{digest[:12]}"
+    job_id = f"{project_name}:{digest[:20]}"
+    return workspace_name, design_name, job_id
+
+
+def _find_existing_results_by_yaml_name(
+    project_name: str,
+    yaml_name: str,
+    structure_only: bool = False,
+) -> Optional[str]:
+    """
+    Fast path for deterministic output IDs before directory-wide scanning.
+    """
+    if not yaml_name:
+        return None
+    project_dir = os.path.join(RESULTS_DIR, project_name)
+    yaml_filepath = os.path.join(project_dir, f"{yaml_name}.yaml")
+    if not os.path.exists(yaml_filepath):
+        return None
+    is_valid, _ = validate_boltz_results(yaml_filepath, structure_only=structure_only)
+    if not is_valid:
+        return None
+    return yaml_name
+
+
+def discover_gpu_devices() -> List[Tuple[str, str]]:
+    """
+    Discover available CUDA GPUs for user-facing selection.
+
+    Returns:
+        List of (gpu_index, gpu_name) tuples.
+    """
+    devices: List[Tuple[str, str]] = []
+
+    # Prefer torch for reliable CUDA device names if available.
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            count = torch.cuda.device_count()
+            for idx in range(count):
+                devices.append((str(idx), torch.cuda.get_device_name(idx)))
+            if devices:
+                return devices
+    except Exception:
+        pass
+
+    # Fallback to nvidia-smi when torch is unavailable/incomplete.
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            for line in result.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",", 1)]
+                if len(parts) == 2:
+                    devices.append((parts[0], parts[1]))
+    except Exception:
+        pass
+
+    return devices
+
+# =============================================================================
+# MSA CACHING INTEGRATION
+# =============================================================================
+# The MSA (Multiple Sequence Alignment) caching system dramatically accelerates
+# pharmacogenomic screening by reusing MSA computations across related predictions.
+#
+# Scientific Justification:
+# - MSA captures evolutionary covariance between residue positions
+# - Point mutations don't change protein family membership
+# - Same homologous sequences are found for WT and mutants
+# - Boltz-2 uses MSA for co-evolutionary signal (family-level information)
+#
+# Performance Impact:
+# - MSA generation: ~30-60 seconds per query
+# - For N mutants × M drugs: reduces N×M MSA generations to just 1
+# - Typical time savings: 95-99% for mutation screening workflows
+# =============================================================================
+
+def get_or_create_msa_cache_for_screening(
+    wt_sequence: str,
+    project_name: str,
+    first_drug_smiles: str,
+    boltz_params: Dict[str, Any],
+    enable_msa_cache: bool = True
+) -> Tuple[Optional[str], bool]:
+    """
+    Get cached MSA for a protein sequence, or prepare for MSA generation.
+
+    This function implements the "generate once, reuse many" strategy for MSA
+    caching in mutation screening workflows.
+
+    Args:
+        wt_sequence: Wild-type protein sequence
+        project_name: Name of the screening project
+        first_drug_smiles: SMILES of first drug (used if we need to generate MSA)
+        boltz_params: Boltz prediction parameters
+        enable_msa_cache: Whether to use MSA caching
+
+    Returns:
+        Tuple of (msa_path or None, should_use_cached_msa)
+    """
+    if not enable_msa_cache or get_msa_cache is None:
+        return None, False
+
+    cache = get_msa_cache()
+
+    # Check if MSA already exists for this protein
+    existing_msa = cache.get_cached_msa(wt_sequence)
+    if existing_msa:
+        return existing_msa, True
+
+    # MSA not cached - return None so caller generates it
+    # The MSA will be cached after the first prediction completes
+    return None, False
+
+
+def cache_msa_after_prediction(
+    protein_sequence: str,
+    yaml_filepath: str,
+    enable_msa_cache: bool = True
+) -> Optional[str]:
+    """
+    Cache the MSA generated by a Boltz prediction for future reuse.
+
+    Call this after a successful Boltz prediction to cache the MSA.
+
+    Args:
+        protein_sequence: The protein sequence that was predicted
+        yaml_filepath: Path to the YAML file used for prediction
+        enable_msa_cache: Whether MSA caching is enabled
+
+    Returns:
+        Path to cached MSA, or None if caching failed/disabled
+    """
+    if not enable_msa_cache or get_msa_cache is None:
+        return None
+
+    try:
+        cache = get_msa_cache()
+
+        # Construct path to Boltz output directory
+        yaml_dir = os.path.dirname(yaml_filepath)
+        yaml_name = os.path.splitext(os.path.basename(yaml_filepath))[0]
+        boltz_output_dir = os.path.join(yaml_dir, f"boltz_results_{yaml_name}")
+
+        if os.path.exists(boltz_output_dir):
+            return cache.cache_msa_from_boltz_output(
+                protein_sequence,
+                boltz_output_dir,
+                source_info={"yaml_file": yaml_filepath}
+            )
+    except Exception as e:
+        # MSA caching is an optimization - don't fail the prediction if caching fails
+        logger.warning("Failed to cache MSA: %s", e, exc_info=True)
+
+    return None
+
+
+def get_msa_for_mutant(
+    wt_sequence: str,
+    mutant_sequence: str,
+    mutations: List[Tuple[str, int, str, str]] = None,
+    enable_msa_cache: bool = True
+) -> Tuple[Optional[str], bool]:
+    """
+    Get MSA for a mutant sequence, leveraging WT MSA cache.
+
+    For point mutations, we can reuse the WT MSA since the evolutionary
+    context is essentially identical.
+
+    Args:
+        wt_sequence: Wild-type protein sequence
+        mutant_sequence: Mutant protein sequence
+        mutations: List of mutations as (chain_id, position, wt_res, mut_res)
+        enable_msa_cache: Whether MSA caching is enabled
+
+    Returns:
+        Tuple of (msa_path or None, should_use_cached_msa)
+    """
+    if not enable_msa_cache or get_msa_cache is None:
+        return None, False
+
+    cache = get_msa_cache()
+
+    # Prefer a mutant-specific cache entry if present.
+    mutant_msa = cache.get_cached_msa(mutant_sequence)
+    if mutant_msa:
+        return mutant_msa, True
+
+    # Fall back to WT cache; when available, attempt to create a mutant-specific
+    # query row for best sequence consistency while reusing homolog rows.
+    wt_msa = cache.get_cached_msa(wt_sequence)
+    if wt_msa:
+        try:
+            mutant_specific_msa = cache.create_mutant_msa(
+                wt_sequence=wt_sequence,
+                mutant_sequence=mutant_sequence,
+                mutations=mutations or [],
+            )
+            if mutant_specific_msa:
+                return mutant_specific_msa, True
+        except Exception as e:
+            # MSA caching is an optimization path; safe fallback to WT cache.
+            logger.warning("Failed to create mutant-specific MSA, falling back to WT MSA: %s", e, exc_info=True)
+        return wt_msa, True
+
+    return None, False
+
+
+def resolve_msa_cache_for_prediction(
+    protein_sequence: str,
+    wt_sequence: Optional[str] = None,
+    enable_msa_cache: bool = True,
+) -> Tuple[Optional[str], bool]:
+    """
+    Resolve whether a cached MSA can be used for this prediction.
+
+    Returns:
+        Tuple of (msa_path, use_cached_msa)
+    """
+    if not enable_msa_cache:
+        return None, False
+
+    try:
+        if wt_sequence and wt_sequence != protein_sequence:
+            msa_path, use_cached = get_msa_for_mutant(
+                wt_sequence=wt_sequence,
+                mutant_sequence=protein_sequence,
+                enable_msa_cache=enable_msa_cache,
+            )
+            if msa_path and use_cached:
+                return msa_path, True
+
+        if should_use_msa_cache is not None:
+            use_cached, msa_path = should_use_msa_cache(
+                protein_sequence=protein_sequence,
+                wt_sequence=None,
+                enable_cache=enable_msa_cache,
+            )
+            if use_cached and msa_path:
+                return msa_path, True
+    except Exception as e:
+        logger.warning("Failed to resolve cached MSA, will generate fresh: %s", e, exc_info=True)
+
+    return None, False
+
+
+def _extract_mutation_positions_from_name(protein_name: str) -> List[int]:
+    """Extract residue numbers from mutation labels like Y652A-F656A."""
+    if not protein_name:
+        return []
+    matches = re.findall(r"[A-Za-z](\d+)[A-Za-z]", str(protein_name))
+    positions: List[int] = []
+    for m in matches:
+        try:
+            pos = int(m)
+        except Exception:
+            continue
+        if pos > 0:
+            positions.append(pos)
+    return sorted(set(positions))
+
+
+def _resolve_mutation_steering_constraints(
+    protein_name: str,
+    protein_sequence: str,
+    base_constraints: Optional[Dict[str, Any]],
+    structure_only: bool,
+    mutation_steering_config: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Build mutation-neighborhood pocket constraints, preserving manual constraints when present.
+    """
+    if structure_only:
+        return base_constraints
+    if not mutation_steering_config or not mutation_steering_config.get("enabled", False):
+        return base_constraints
+    if not mutation_steering_config.get("mutation_mode_active", False):
+        return base_constraints
+    if _is_wt_name(protein_name) and not mutation_steering_config.get("apply_to_wt", False):
+        return base_constraints
+
+    mutation_positions = _extract_mutation_positions_from_name(protein_name)
+    if not mutation_positions:
+        return base_constraints
+
+    is_valid, _, chains_dict, _ = validate_protein_sequence(protein_sequence)
+    if not is_valid or not chains_dict:
+        return base_constraints
+
+    chain_starts = mutation_steering_config.get("chain_starts") or {}
+    neighborhood = int(mutation_steering_config.get("window", 3))
+    neighborhood = max(0, neighborhood)
+    steering_max_distance = float(mutation_steering_config.get("max_distance", 6.0))
+
+    contacts_set: Set[Tuple[str, int]] = set()
+    if base_constraints and base_constraints.get("contacts"):
+        for chain_id, residue_idx in base_constraints.get("contacts", []):
+            try:
+                contacts_set.add((str(chain_id), int(residue_idx)))
+            except Exception:
+                continue
+
+    for residue_number in mutation_positions:
+        for chain_id, chain_seq in chains_dict.items():
+            chain_start = int(chain_starts.get(chain_id, 1))
+            chain_end = chain_start + len(chain_seq) - 1
+            if not (chain_start <= residue_number <= chain_end):
+                continue
+            local_residue = residue_number - chain_start + 1
+            for idx in range(local_residue - neighborhood, local_residue + neighborhood + 1):
+                if 1 <= idx <= len(chain_seq):
+                    contacts_set.add((chain_id, idx))
+
+    if not contacts_set:
+        return base_constraints
+
+    sorted_contacts = sorted(contacts_set, key=lambda item: (item[0], item[1]))
+    binder = (base_constraints or {}).get("binder", "X")
+    max_distance = float((base_constraints or {}).get("max_distance", steering_max_distance))
+    mode = (base_constraints or {}).get("mode", "mutation_steering")
+    if base_constraints and base_constraints.get("contacts"):
+        mode = f"{mode}+mutation_steering"
+
+    return {
+        "binder": binder,
+        "contacts": [[chain_id, residue_idx] for chain_id, residue_idx in sorted_contacts],
+        "max_distance": max_distance,
+        "mode": mode,
+        "source": "mutation_neighborhood",
+        "mutation_positions": mutation_positions,
+        "neighborhood_window": neighborhood,
+    }
+
+
 def load_css():
     """Loads custom CSS for styling the application."""
     if styles:
-        for css in [styles.header_css, styles.bubble_css, styles.button_css, 
+        for css in [styles.header_css, styles.bubble_css, styles.button_css,
                    styles.dialog_and_plot_css, styles.modify_streamlit_style]:
             st.markdown(css, unsafe_allow_html=True)
     st.markdown("""
@@ -140,20 +755,52 @@ def load_css():
     </style>
     """, unsafe_allow_html=True)
 
-def create_screening_boltz_yaml(workspace_name, design_name, protein_sequence, ligand_smiles, project_name, binding_pocket_constraints=None, cofactor_info=None, template_cif_path=None, structure_only=False, ptm_modifications=None):
-    """Create a YAML file for Boltz prediction in the project-specific directory."""
+def create_screening_boltz_yaml(
+    workspace_name,
+    design_name,
+    protein_sequence,
+    ligand_smiles,
+    project_name,
+    binding_pocket_constraints=None,
+    cofactor_info=None,
+    template_cif_path=None,
+    structure_only=False,
+    ptm_modifications=None,
+    msa_path=None,
+    target_directory: Optional[str] = None,
+):
+    """Create a YAML file for Boltz prediction in the project-specific directory.
+
+    Args:
+        workspace_name: Name of the workspace/project
+        design_name: Name of this specific design/prediction
+        protein_sequence: Protein amino acid sequence (chains separated by ':')
+        ligand_smiles: SMILES string for the ligand
+        project_name: Name of the screening project
+        binding_pocket_constraints: Optional binding pocket constraints
+        cofactor_info: Optional cofactor information
+        template_cif_path: Optional path to template CIF file
+        structure_only: If True, skip affinity prediction
+        ptm_modifications: Optional post-translational modifications
+        msa_path: Optional path to cached MSA file. When provided, Boltz will use
+                  this pre-computed MSA instead of querying the MSA server, which
+                  dramatically speeds up mutation screening (95%+ time savings).
+
+    Returns:
+        Path to the created YAML file
+    """
     # Create project directory
-    project_dir = os.path.join("boltzomics_screening_results", project_name)
+    project_dir = target_directory or os.path.join("boltzomics_screening_results", project_name)
     if not os.path.exists(project_dir):
         os.makedirs(project_dir)
-    
+
     # Create filename
     filename = f"{workspace_name}_{design_name}.yaml"
     filepath = os.path.join(project_dir, filename)
-    
-    # Parse protein sequence into chains
+
+    # Parse protein sequence into chains (with optional MSA path for caching)
     try:
-        protein_chains = parse_protein_chains(protein_sequence)
+        protein_chains = parse_protein_chains(protein_sequence, msa_path=msa_path)
     except ValueError as e:
         raise ValueError(f"Invalid protein sequence format: {str(e)}")
     
@@ -346,6 +993,27 @@ def run_boltz_with_retry(
     max_parallel_samples=5,
     step_scale=1.638,
     affinity_mw_correction=False,
+    external_boltz_patch_enabled: bool = False,
+    external_boltz_patch_mode: str = "mutation_aware_v2",
+    external_boltz_patch_weight_floor: float = 0.05,
+    external_boltz_patch_entropy_alpha: float = 0.20,
+    external_boltz_patch_uncertainty_penalty: float = 0.15,
+    external_boltz_patch_min_confidence: float = 0.35,
+    affinity_multisampling_enabled: bool = False,
+    affinity_multisampling_profiles: Optional[List[Dict[str, int]]] = None,
+    affinity_multisampling_settings: Optional[List[str]] = None,
+    affinity_multisampling_refinement_steps: Optional[List[int]] = None,
+    affinity_multisampling_aggregate_mode: str = "median",
+    affinity_multisampling_apply_aggregate: bool = True,
+    affinity_multisampling_early_stop_enabled: bool = True,
+    affinity_multisampling_early_stop_min_points: int = 2,
+    affinity_multisampling_early_stop_delta: float = 0.02,
+    affinity_multisampling_early_stop_std: float = 0.04,
+    affinity_multisampling_early_stop_patience: int = 1,
+    affinity_multisampling_robust_outlier_filter: bool = True,
+    affinity_multisampling_robust_outlier_zmax: float = 3.5,
+    affinity_multisampling_bootstrap_samples: int = 300,
+    confidence_target: str = "balanced",
     max_msa_seqs=8192,
     sampling_steps_affinity=200,
     diffusion_samples_affinity=5,
@@ -359,12 +1027,38 @@ def run_boltz_with_retry(
     structure_only=False,
     ptm_modifications=None,
     prediction_timeout_seconds=300,
+    accelerator: str = "gpu",
+    devices: int = 1,
+    cuda_visible_devices: Optional[str] = None,
+    preprocessing_threads: int = 1,
+    use_potentials: bool = False,
+    method: Optional[str] = None,
     emit_streamlit_feedback=True,
     status_callback: Optional[Callable[[str, Dict[str, Union[str, int, float]]], None]] = None,
+    msa_path: Optional[str] = None,
+    use_cached_msa: bool = False,
+    enable_msa_cache: bool = True,
 ):
-    """Run Boltz workflow with retry logic and validation."""
+    """Run Boltz workflow with retry logic and validation.
+
+    Args:
+        ... (existing params)
+        msa_path: Optional path to cached MSA file. When provided, uses pre-computed
+                  MSA instead of querying MSA server, dramatically speeding up
+                  mutation screening.
+        use_cached_msa: If True and msa_path is provided, skip --use_msa_server flag.
+        enable_msa_cache: If True, cache newly generated MSA files after successful runs.
+    """
     last_error = None
     total_attempts = max_retry_attempts + 1 if enable_retries else 1
+    current_msa_path = msa_path
+    current_use_cached_msa = bool(use_cached_msa)
+    cache_fallback_triggered = False
+    patch_mutation_positions = (
+        _extract_mutation_positions_from_label(protein_display_name)
+        if external_boltz_patch_enabled
+        else []
+    )
 
     def notify(event: str, payload: Dict[str, Union[str, int, float]]) -> None:
         if status_callback:
@@ -386,23 +1080,38 @@ def run_boltz_with_retry(
                 template_cif_path,
                 structure_only,
                 ptm_modifications,
+                msa_path=current_msa_path,  # MSA caching support
             )
             utils.run_boltz_prediction(
-                yaml_filepath,
-                use_gpu,
-                override,
-                recycling_steps,
-                sampling_steps,
-                diffusion_samples,
-                max_parallel_samples,
-                step_scale,
-                affinity_mw_correction,
-                max_msa_seqs,
-                sampling_steps_affinity,
-                diffusion_samples_affinity,
-                subsample_msa,
-                num_subsampled_msa,
+                yaml_filepath=yaml_filepath,
+                use_gpu=use_gpu,
+                override=override,
+                recycling_steps=recycling_steps,
+                sampling_steps=sampling_steps,
+                diffusion_samples=diffusion_samples,
+                max_parallel_samples=max_parallel_samples,
+                step_scale=step_scale,
+                affinity_mw_correction=affinity_mw_correction,
+                external_boltz_patch_enabled=external_boltz_patch_enabled,
+                external_boltz_patch_mode=external_boltz_patch_mode,
+                external_boltz_patch_weight_floor=external_boltz_patch_weight_floor,
+                external_boltz_patch_entropy_alpha=external_boltz_patch_entropy_alpha,
+                external_boltz_patch_uncertainty_penalty=external_boltz_patch_uncertainty_penalty,
+                external_boltz_patch_min_confidence=external_boltz_patch_min_confidence,
+                external_boltz_patch_mutation_positions=patch_mutation_positions,
+                max_msa_seqs=max_msa_seqs,
+                sampling_steps_affinity=sampling_steps_affinity,
+                diffusion_samples_affinity=diffusion_samples_affinity,
+                subsample_msa=subsample_msa,
+                num_subsampled_msa=num_subsampled_msa,
                 timeout=prediction_timeout_seconds,
+                use_cached_msa=current_use_cached_msa,  # Skip MSA server when using cache
+                accelerator=accelerator,
+                devices=devices,
+                cuda_visible_devices=cuda_visible_devices,
+                preprocessing_threads=preprocessing_threads,
+                use_potentials=use_potentials,
+                method=method,
             )
             is_valid, validation_error = validate_boltz_results(yaml_filepath, structure_only=structure_only)
             if not is_valid:
@@ -410,6 +1119,84 @@ def run_boltz_with_retry(
             results = utils.parse_boltz_results(yaml_filepath, structure_only=structure_only)
             if results is None:
                 raise Exception("Failed to parse Boltz results")
+
+            if (
+                affinity_multisampling_enabled
+                and (not structure_only)
+                and run_affinity_multisampling is not None
+            ):
+                multi_result = run_affinity_multisampling(
+                    yaml_filepath=yaml_filepath,
+                    use_gpu=use_gpu,
+                    override=False,  # keep structure cached; only refresh affinity output
+                    recycling_steps=recycling_steps,
+                    sampling_steps=sampling_steps,
+                    diffusion_samples=diffusion_samples,
+                    max_parallel_samples=max_parallel_samples,
+                    step_scale=step_scale,
+                    affinity_mw_correction=affinity_mw_correction,
+                    max_msa_seqs=max_msa_seqs,
+                    subsample_msa=subsample_msa,
+                    num_subsampled_msa=num_subsampled_msa,
+                    timeout=prediction_timeout_seconds,
+                    use_cached_msa=current_use_cached_msa,
+                    accelerator=accelerator,
+                    devices=devices,
+                    cuda_visible_devices=cuda_visible_devices,
+                    preprocessing_threads=preprocessing_threads,
+                    use_potentials=use_potentials,
+                    method=method,
+                    external_boltz_patch_enabled=external_boltz_patch_enabled,
+                    external_boltz_patch_mode=external_boltz_patch_mode,
+                    external_boltz_patch_weight_floor=external_boltz_patch_weight_floor,
+                    external_boltz_patch_entropy_alpha=external_boltz_patch_entropy_alpha,
+                    external_boltz_patch_uncertainty_penalty=external_boltz_patch_uncertainty_penalty,
+                    external_boltz_patch_min_confidence=external_boltz_patch_min_confidence,
+                    external_boltz_patch_mutation_positions=patch_mutation_positions,
+                    sampling_steps_affinity_base=sampling_steps_affinity,
+                    diffusion_samples_affinity_base=diffusion_samples_affinity,
+                    profiles=affinity_multisampling_profiles,
+                    refinement_steps=affinity_multisampling_refinement_steps,
+                    aggregate_mode=affinity_multisampling_aggregate_mode,
+                    apply_aggregate=affinity_multisampling_apply_aggregate,
+                    confidence_target=confidence_target,
+                    early_stop_enabled=affinity_multisampling_early_stop_enabled,
+                    early_stop_min_points=affinity_multisampling_early_stop_min_points,
+                    early_stop_delta=affinity_multisampling_early_stop_delta,
+                    early_stop_std=affinity_multisampling_early_stop_std,
+                    early_stop_patience=affinity_multisampling_early_stop_patience,
+                    robust_outlier_filter=affinity_multisampling_robust_outlier_filter,
+                    robust_outlier_zmax=affinity_multisampling_robust_outlier_zmax,
+                    bootstrap_samples=affinity_multisampling_bootstrap_samples,
+                )
+                if multi_result.success:
+                    results = utils.parse_boltz_results(yaml_filepath, structure_only=structure_only) or results
+
+            # Cache newly generated MSA so subsequent mutant/drug jobs can reuse it.
+            if enable_msa_cache and not current_use_cached_msa:
+                cache_msa_after_prediction(
+                    protein_sequence=protein_sequence,
+                    yaml_filepath=yaml_filepath,
+                    enable_msa_cache=enable_msa_cache,
+                )
+
+            # Track MSA source in results for post-hoc analysis
+            if results and isinstance(results, dict):
+                if cache_fallback_triggered:
+                    results["msa_source"] = "fresh_after_fallback"
+                    results["msa_cache_fallback"] = True
+                    results["msa_cache_fallback_error"] = (last_error or "")[:500]
+                elif current_use_cached_msa:
+                    results["msa_source"] = "cached"
+                else:
+                    results["msa_source"] = "fresh"
+
+            if cache_fallback_triggered and emit_streamlit_feedback:
+                st.info(
+                    f"Note: {protein_display_name} + {ligand_display_name} succeeded after "
+                    f"MSA cache fallback (original cached-MSA error: {(last_error or '')[:100]})"
+                )
+
             if attempt > 0:
                 notify(
                     "success",
@@ -424,6 +1211,37 @@ def run_boltz_with_retry(
             return results, True, None
         except Exception as e:
             last_error = str(e)
+
+            # Robust fallback: some cached-MSA runs can complete structure/confidence
+            # yet miss affinity output; retry with fresh MSA generation.
+            missing_affinity_output = (
+                "Affinity results file not found" in last_error
+                or "affinity_" in last_error.lower() and "not found" in last_error.lower()
+            )
+            cached_input_processing_failure = "input processing failure" in last_error.lower()
+            if (
+                current_use_cached_msa
+                and (missing_affinity_output or cached_input_processing_failure)
+                and attempt < max_retry_attempts
+            ):
+                current_use_cached_msa = False
+                current_msa_path = None
+                cache_fallback_triggered = True
+                notify(
+                    "msa_cache_fallback",
+                    {
+                        "attempt": attempt + 1,
+                        "protein": protein_display_name,
+                        "ligand": ligand_display_name,
+                        "error": last_error[:200],
+                    },
+                )
+                if emit_streamlit_feedback:
+                    st.warning(
+                        "Cached MSA run produced incomplete affinity output; retrying with fresh MSA generation."
+                    )
+                continue
+
             if enable_retries and attempt < max_retry_attempts:
                 delay = retry_delay_base * (2 ** attempt)
                 notify(
@@ -455,6 +1273,15 @@ def run_boltz_with_retry(
                         st.error(f"All {total_attempts} attempts failed for {protein_display_name} + {ligand_display_name}: {str(e)[:100]}")
                     else:
                         st.error(f"Prediction failed for {protein_display_name} + {ligand_display_name}: {str(e)[:100]}")
+    if cache_fallback_triggered:
+        notify(
+            "msa_cache_fallback_exhausted",
+            {
+                "protein": protein_display_name,
+                "ligand": ligand_display_name,
+                "error": (last_error or "")[:200],
+            },
+        )
     return None, False, last_error
 
 
@@ -476,11 +1303,21 @@ def _generate_workspace_name(prefix: str = "screening") -> str:
 
 
 def _build_boltz_command(yaml_filename: str, params: Dict[str, Any]) -> str:
-    cmd: List[str] = ["boltz", "predict", yaml_filename, "--use_msa_server", "--output_format", "pdb"]
+    external_patch_enabled = bool(params.get("external_boltz_patch_enabled", False))
+    if external_patch_enabled:
+        patch_cli = os.path.join(MODULES_DIR, "boltz2_patched_cli.py")
+        cmd: List[str] = ["python", patch_cli, "predict", yaml_filename]
+    else:
+        cmd = ["boltz", "predict", yaml_filename]
+    if not params.get("use_cached_msa", False):
+        cmd.append("--use_msa_server")
+    cmd.extend(["--output_format", "pdb"])
+    accelerator = str(params.get("accelerator", "gpu")).lower()
+    cmd.extend(["--accelerator", accelerator])
+    cmd.extend(["--devices", str(int(params.get("devices", 1)))])
+    cmd.extend(["--preprocessing-threads", str(int(params.get("preprocessing_threads", 1)))])
     if params.get("override"):
         cmd.append("--override")
-    if not params.get("use_gpu", True):
-        cmd.extend(["--accelerator", "cpu"])
     cmd.extend(["--recycling_steps", str(int(params.get("recycling_steps", 3)))])
     cmd.extend(["--sampling_steps", str(int(params.get("sampling_steps", 200)))])
     cmd.extend(["--diffusion_samples", str(int(params.get("diffusion_samples", 1)))])
@@ -488,19 +1325,256 @@ def _build_boltz_command(yaml_filename: str, params: Dict[str, Any]) -> str:
     cmd.extend(["--step_scale", str(float(params.get("step_scale", 1.638)))])
     if params.get("affinity_mw_correction"):
         cmd.append("--affinity_mw_correction")
+    if params.get("use_potentials"):
+        cmd.append("--use_potentials")
+    method = params.get("method")
+    if method:
+        cmd.extend(["--method", str(method)])
     cmd.extend(["--max_msa_seqs", str(int(params.get("max_msa_seqs", 8192)))])
     cmd.extend(["--sampling_steps_affinity", str(int(params.get("sampling_steps_affinity", 200)))])
     cmd.extend(["--diffusion_samples_affinity", str(int(params.get("diffusion_samples_affinity", 5)))])
     if params.get("subsample_msa"):
         cmd.append("--subsample_msa")
         cmd.extend(["--num_subsampled_msa", str(int(params.get("num_subsampled_msa", 1024)))])
-    return " ".join(cmd)
+    cmd_str = " ".join(cmd)
+    if external_patch_enabled:
+        env_parts = [
+            "BOLTZ2_EXTERNAL_PATCH_ENABLED=1",
+            f"BOLTZ2_EXTERNAL_PATCH_MODE={params.get('external_boltz_patch_mode', 'mutation_aware_v2')}",
+            f"BOLTZ2_EXTERNAL_PATCH_WEIGHT_FLOOR={float(params.get('external_boltz_patch_weight_floor', 0.05))}",
+            f"BOLTZ2_EXTERNAL_PATCH_ENTROPY_ALPHA={float(params.get('external_boltz_patch_entropy_alpha', 0.20))}",
+            f"BOLTZ2_EXTERNAL_PATCH_UNCERTAINTY_PENALTY={float(params.get('external_boltz_patch_uncertainty_penalty', 0.15))}",
+            f"BOLTZ2_EXTERNAL_PATCH_MIN_CONFIDENCE={float(params.get('external_boltz_patch_min_confidence', 0.35))}",
+        ]
+        cmd_str = f"{' '.join(env_parts)} {cmd_str}"
+    cuda_visible_devices = params.get("cuda_visible_devices")
+    if accelerator == "gpu" and cuda_visible_devices not in (None, "", "auto"):
+        cmd_str = f"CUDA_VISIBLE_DEVICES={cuda_visible_devices} {cmd_str}"
+    return cmd_str
+
+
+def _build_boltz_batch_command(input_path: str, params: Dict[str, Any], use_msa_server: bool) -> str:
+    external_patch_enabled = bool(params.get("external_boltz_patch_enabled", False))
+    if external_patch_enabled:
+        patch_cli = os.path.join(MODULES_DIR, "boltz2_patched_cli.py")
+        cmd: List[str] = ["python", patch_cli, "predict", input_path]
+    else:
+        cmd = ["boltz", "predict", input_path]
+    if use_msa_server:
+        cmd.append("--use_msa_server")
+    cmd.extend(["--output_format", "pdb"])
+    accelerator = str(params.get("accelerator", "gpu")).lower()
+    cmd.extend(["--accelerator", accelerator])
+    cmd.extend(["--devices", str(int(params.get("devices", 1)))])
+    cmd.extend(["--preprocessing-threads", str(int(params.get("preprocessing_threads", 1)))])
+    if params.get("override"):
+        cmd.append("--override")
+    cmd.extend(["--recycling_steps", str(int(params.get("recycling_steps", 3)))])
+    cmd.extend(["--sampling_steps", str(int(params.get("sampling_steps", 200)))])
+    cmd.extend(["--diffusion_samples", str(int(params.get("diffusion_samples", 1)))])
+    cmd.extend(["--max_parallel_samples", str(int(params.get("max_parallel_samples", 5)))])
+    cmd.extend(["--step_scale", str(float(params.get("step_scale", 1.638)))])
+    if params.get("affinity_mw_correction"):
+        cmd.append("--affinity_mw_correction")
+    if params.get("use_potentials"):
+        cmd.append("--use_potentials")
+    method = params.get("method")
+    if method:
+        cmd.extend(["--method", str(method)])
+    cmd.extend(["--max_msa_seqs", str(int(params.get("max_msa_seqs", 8192)))])
+    cmd.extend(["--sampling_steps_affinity", str(int(params.get("sampling_steps_affinity", 200)))])
+    cmd.extend(["--diffusion_samples_affinity", str(int(params.get("diffusion_samples_affinity", 5)))])
+    if params.get("subsample_msa"):
+        cmd.append("--subsample_msa")
+        cmd.extend(["--num_subsampled_msa", str(int(params.get("num_subsampled_msa", 1024)))])
+    cmd_str = " ".join(cmd)
+    if external_patch_enabled:
+        env_parts = [
+            "BOLTZ2_EXTERNAL_PATCH_ENABLED=1",
+            f"BOLTZ2_EXTERNAL_PATCH_MODE={params.get('external_boltz_patch_mode', 'mutation_aware_v2')}",
+            f"BOLTZ2_EXTERNAL_PATCH_WEIGHT_FLOOR={float(params.get('external_boltz_patch_weight_floor', 0.05))}",
+            f"BOLTZ2_EXTERNAL_PATCH_ENTROPY_ALPHA={float(params.get('external_boltz_patch_entropy_alpha', 0.20))}",
+            f"BOLTZ2_EXTERNAL_PATCH_UNCERTAINTY_PENALTY={float(params.get('external_boltz_patch_uncertainty_penalty', 0.15))}",
+            f"BOLTZ2_EXTERNAL_PATCH_MIN_CONFIDENCE={float(params.get('external_boltz_patch_min_confidence', 0.35))}",
+        ]
+        cmd_str = f"{' '.join(env_parts)} {cmd_str}"
+    cuda_visible_devices = params.get("cuda_visible_devices")
+    if accelerator == "gpu" and cuda_visible_devices not in (None, "", "auto"):
+        cmd_str = f"CUDA_VISIBLE_DEVICES={cuda_visible_devices} {cmd_str}"
+    return cmd_str
 
 
 def _extract_workspace_design(yaml_name: str) -> Tuple[str, str]:
     if not yaml_name:
         return "screening", "screening"
     return yaml_name, yaml_name
+
+
+def _to_float_or_none(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        v = float(value)
+        if np.isfinite(v):
+            return v
+        return None
+    except (TypeError, ValueError):
+        return None
+
+
+def _compute_affinity_consensus(
+    boltz_results: Dict[str, Any],
+    params: Dict[str, Any],
+) -> Dict[str, Any]:
+    # Multi-sampling stores both raw single-run and aggregated values.
+    # Keep raw as the selected table/CSV value; keep aggregate for plotting/analysis.
+    if bool(boltz_results.get("affinity_multisampling_applied", False)):
+        aggregated_value = _to_float_or_none(
+            boltz_results.get("affinity_multisampling_aggregate", boltz_results.get("affinity_pred_value"))
+        )
+        aggregated_prob = _to_float_or_none(
+            boltz_results.get(
+                "affinity_multisampling_probability_aggregate",
+                boltz_results.get("affinity_probability_binary"),
+            )
+        )
+        selected_value = _to_float_or_none(
+            boltz_results.get(
+                "affinity_pred_value_raw_before_multisampling",
+                boltz_results.get("affinity_pred_value"),
+            )
+        )
+        selected_prob = _to_float_or_none(
+            boltz_results.get(
+                "affinity_probability_binary_raw_before_multisampling",
+                boltz_results.get("affinity_probability_binary"),
+            )
+        )
+        if aggregated_value is None:
+            aggregated_value = selected_value
+        if aggregated_prob is None:
+            aggregated_prob = selected_prob
+        if selected_value is None:
+            selected_value = 0.0
+        if selected_prob is None:
+            selected_prob = 0.0
+        return {
+            "selected_affinity_pred_value": float(selected_value),
+            "selected_affinity_probability": float(selected_prob),
+            "raw_affinity_pred_value": _to_float_or_none(boltz_results.get("affinity_pred_value_raw_before_multisampling")),
+            "raw_affinity_probability": _to_float_or_none(boltz_results.get("affinity_probability_binary_raw_before_multisampling")),
+            "consensus_enabled": True,
+            "consensus_mode": "multisampling_aggregate",
+            "consensus_n_heads": int(boltz_results.get("affinity_multisampling_n", 1) or 1),
+            "consensus_pred_value": float(aggregated_value if aggregated_value is not None else selected_value),
+            "consensus_probability": float(aggregated_prob if aggregated_prob is not None else selected_prob),
+            "consensus_std": _to_float_or_none(boltz_results.get("affinity_multisampling_std")),
+            "consensus_head_values": {},
+            "consensus_head_probabilities": {},
+        }
+
+    raw_value = _to_float_or_none(boltz_results.get("affinity_pred_value"))
+    raw_prob = _to_float_or_none(boltz_results.get("affinity_probability_binary"))
+
+    heads = [
+        ("main", raw_value, raw_prob),
+        (
+            "head1",
+            _to_float_or_none(boltz_results.get("affinity_pred_value1")),
+            _to_float_or_none(boltz_results.get("affinity_probability_binary1")),
+        ),
+        (
+            "head2",
+            _to_float_or_none(boltz_results.get("affinity_pred_value2")),
+            _to_float_or_none(boltz_results.get("affinity_probability_binary2")),
+        ),
+    ]
+    valid_heads = [(name, value, prob) for name, value, prob in heads if value is not None]
+
+    enabled = bool(params.get("affinity_consensus_enabled", False))
+    mode = str(params.get("affinity_consensus_mode", "weighted")).strip().lower()
+    if mode not in {"weighted", "median", "trimmed_mean"}:
+        mode = "weighted"
+    weight_floor = max(0.0, float(params.get("affinity_consensus_weight_floor", 0.05)))
+    entropy_alpha = min(1.0, max(0.0, float(params.get("affinity_consensus_entropy_alpha", 0.2))))
+
+    if not valid_heads:
+        return {
+            "selected_affinity_pred_value": 0.0,
+            "selected_affinity_probability": 0.0,
+            "raw_affinity_pred_value": raw_value,
+            "raw_affinity_probability": raw_prob,
+            "consensus_enabled": enabled,
+            "consensus_mode": mode,
+            "consensus_n_heads": 0,
+            "consensus_pred_value": None,
+            "consensus_probability": None,
+            "consensus_std": None,
+            "consensus_head_values": {},
+            "consensus_head_probabilities": {},
+        }
+
+    values = np.array([v for _, v, _ in valid_heads], dtype=float)
+    probs = np.array(
+        [
+            (p if p is not None else 0.5)
+            for _, _, p in valid_heads
+        ],
+        dtype=float,
+    )
+
+    if not enabled or len(values) == 1:
+        consensus_value = float(values[0] if raw_value is None else raw_value)
+        consensus_prob = float(probs[0] if raw_prob is None else raw_prob)
+    elif mode == "median":
+        consensus_value = float(np.median(values))
+        consensus_prob = float(np.median(probs))
+    elif mode == "trimmed_mean":
+        if len(values) >= 3:
+            order = np.argsort(values)
+            keep = order[1:-1]
+            consensus_value = float(np.mean(values[keep]))
+            consensus_prob = float(np.mean(probs[keep]))
+        else:
+            consensus_value = float(np.mean(values))
+            consensus_prob = float(np.mean(probs))
+    else:
+        # Weighted mode: down-weight uncertain heads where binary probability is near 0.5.
+        prob_center_distance = np.abs(probs - 0.5) * 2.0
+        entropy = -(
+            probs * np.log(np.clip(probs, 1e-8, 1.0))
+            + (1.0 - probs) * np.log(np.clip(1.0 - probs, 1e-8, 1.0))
+        ) / np.log(2.0)
+        weights = np.maximum(weight_floor, prob_center_distance) * (1.0 - entropy_alpha * entropy)
+        if float(np.sum(weights)) <= 1e-8:
+            weights = np.ones_like(values, dtype=float)
+        consensus_value = float(np.average(values, weights=weights))
+        consensus_prob = float(np.average(probs, weights=weights))
+
+    consensus_std = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+    selected_value = consensus_value if (enabled and consensus_value is not None) else raw_value
+    selected_prob = consensus_prob if (enabled and consensus_prob is not None) else raw_prob
+    if selected_value is None:
+        selected_value = float(values[0])
+    if selected_prob is None:
+        selected_prob = float(probs[0])
+
+    return {
+        "selected_affinity_pred_value": float(selected_value),
+        "selected_affinity_probability": float(selected_prob),
+        "raw_affinity_pred_value": raw_value,
+        "raw_affinity_probability": raw_prob,
+        "consensus_enabled": enabled,
+        "consensus_mode": mode,
+        "consensus_n_heads": int(len(values)),
+        "consensus_pred_value": float(consensus_value) if consensus_value is not None else None,
+        "consensus_probability": float(consensus_prob) if consensus_prob is not None else None,
+        "consensus_std": float(consensus_std) if consensus_std is not None else None,
+        "consensus_head_values": {name: value for name, value, _ in valid_heads},
+        "consensus_head_probabilities": {
+            name: prob for name, _, prob in valid_heads if prob is not None
+        },
+    }
 
 
 def _create_result_entry(
@@ -513,8 +1587,9 @@ def _create_result_entry(
     boltz_results: Dict[str, Any],
     params: Dict[str, Any],
 ) -> Dict[str, Any]:
-    affinity_pred_value = boltz_results.get("affinity_pred_value", 0)
-    affinity_probability_binary = boltz_results.get("affinity_probability_binary", 0)
+    affinity_meta = _compute_affinity_consensus(boltz_results=boltz_results, params=params)
+    affinity_pred_value = affinity_meta["selected_affinity_pred_value"]
+    affinity_probability_binary = affinity_meta["selected_affinity_probability"]
     confidence = boltz_results.get("confidence_score", 0.85)
     ptm = boltz_results.get("ptm", 0.8)
     iptm = boltz_results.get("iptm", 0.7)
@@ -531,6 +1606,48 @@ def _create_result_entry(
         "ic50_um": ic50,
         "pic50": pic50,
         "affinity_probability": affinity_probability_binary,
+        "affinity_pred_value_raw": affinity_meta["raw_affinity_pred_value"],
+        "affinity_probability_raw": affinity_meta["raw_affinity_probability"],
+        "affinity_pred_value_consensus": affinity_meta["consensus_pred_value"],
+        "affinity_probability_consensus": affinity_meta["consensus_probability"],
+        "affinity_consensus_std": affinity_meta["consensus_std"],
+        "affinity_consensus_n_heads": affinity_meta["consensus_n_heads"],
+        "affinity_consensus_mode": affinity_meta["consensus_mode"],
+        "affinity_consensus_enabled": affinity_meta["consensus_enabled"],
+        "affinity_pred_value_multisampling_aggregate": boltz_results.get("affinity_multisampling_aggregate"),
+        "affinity_probability_multisampling_aggregate": boltz_results.get("affinity_multisampling_probability_aggregate"),
+        "affinity_pred_value1": boltz_results.get("affinity_pred_value1"),
+        "affinity_probability1": boltz_results.get("affinity_probability_binary1"),
+        "affinity_pred_value2": boltz_results.get("affinity_pred_value2"),
+        "affinity_probability2": boltz_results.get("affinity_probability_binary2"),
+        "affinity_multisampling_applied": boltz_results.get("affinity_multisampling_applied"),
+        "affinity_multisampling_mode": boltz_results.get("affinity_multisampling_mode"),
+        "affinity_multisampling_n": boltz_results.get("affinity_multisampling_n"),
+        "affinity_multisampling_std": boltz_results.get("affinity_multisampling_std"),
+        "affinity_multisampling_min": boltz_results.get("affinity_multisampling_min"),
+        "affinity_multisampling_max": boltz_results.get("affinity_multisampling_max"),
+        "affinity_multisampling_setting_values": boltz_results.get("affinity_multisampling_setting_values"),
+        "affinity_multisampling_setting_probabilities": boltz_results.get("affinity_multisampling_setting_probabilities"),
+        "affinity_multisampling_refinement_steps": boltz_results.get("affinity_multisampling_refinement_steps"),
+        "affinity_multisampling_diffusion_samples": boltz_results.get("affinity_multisampling_diffusion_samples"),
+        "affinity_multisampling_profiles": boltz_results.get("affinity_multisampling_setting_profiles"),
+        "affinity_multisampling_setting_profiles": boltz_results.get("affinity_multisampling_setting_profiles"),
+        "affinity_multisampling_recommended_setting": boltz_results.get("affinity_multisampling_recommended_setting"),
+        "affinity_multisampling_weighting_mode": boltz_results.get("affinity_multisampling_weighting_mode"),
+        "affinity_multisampling_setting_uncertainties": boltz_results.get("affinity_multisampling_setting_uncertainties"),
+        "affinity_multisampling_setting_weights": boltz_results.get("affinity_multisampling_setting_weights"),
+        "affinity_patch_mode": boltz_results.get("affinity_patch_mode"),
+        "affinity_patch_applied": boltz_results.get("affinity_patch_applied"),
+        "affinity_patch_topk_applied": boltz_results.get("affinity_patch_topk_applied"),
+        "affinity_patch_topk_k": boltz_results.get("affinity_patch_topk_k"),
+        "affinity_patch_best_idx_raw": boltz_results.get("affinity_patch_best_idx_raw"),
+        "affinity_patch_topk_indices": boltz_results.get("affinity_patch_topk_indices"),
+        "affinity_patch_topk_weights": boltz_results.get("affinity_patch_topk_weights"),
+        "affinity_patch_selector_scores": boltz_results.get("affinity_patch_selector_scores"),
+        "affinity_patch_selector_local_scores": boltz_results.get("affinity_patch_selector_local_scores"),
+        "affinity_patch_selector_local_plddt": boltz_results.get("affinity_patch_selector_local_plddt"),
+        "affinity_patch_selector_local_ipde": boltz_results.get("affinity_patch_selector_local_ipde"),
+        "affinity_patch_selector_mutation_positions": boltz_results.get("affinity_patch_selector_mutation_positions"),
         "confidence": confidence,
         "ptm": ptm,
         "iptm": iptm,
@@ -541,12 +1658,42 @@ def _create_result_entry(
         "cofactor_info": params.get("cofactor_info"),
         "boltz2_parameters": {
             "use_gpu": params.get("use_gpu", True),
+            "accelerator": params.get("accelerator", "gpu"),
+            "devices": params.get("devices", 1),
+            "cuda_visible_devices": params.get("cuda_visible_devices"),
+            "preprocessing_threads": params.get("preprocessing_threads", 1),
             "recycling_steps": params.get("recycling_steps", 3),
             "sampling_steps": params.get("sampling_steps", 200),
             "diffusion_samples": params.get("diffusion_samples", 1),
             "max_parallel_samples": params.get("max_parallel_samples", 5),
             "step_scale": params.get("step_scale", 1.638),
             "affinity_mw_correction": params.get("affinity_mw_correction", False),
+            "affinity_consensus_enabled": params.get("affinity_consensus_enabled", False),
+            "affinity_consensus_mode": params.get("affinity_consensus_mode", "weighted"),
+            "affinity_consensus_weight_floor": params.get("affinity_consensus_weight_floor", 0.05),
+            "affinity_consensus_entropy_alpha": params.get("affinity_consensus_entropy_alpha", 0.2),
+            "affinity_multisampling_enabled": params.get("affinity_multisampling_enabled", False),
+            "affinity_multisampling_profiles": params.get("affinity_multisampling_profiles"),
+            "affinity_multisampling_settings": params.get("affinity_multisampling_settings"),
+            "affinity_multisampling_refinement_steps": params.get("affinity_multisampling_refinement_steps"),
+            "affinity_multisampling_aggregate_mode": params.get("affinity_multisampling_aggregate_mode", "median"),
+            "affinity_multisampling_apply_aggregate": params.get("affinity_multisampling_apply_aggregate", True),
+            "affinity_multisampling_early_stop_enabled": params.get("affinity_multisampling_early_stop_enabled", True),
+            "affinity_multisampling_early_stop_min_points": params.get("affinity_multisampling_early_stop_min_points", 2),
+            "affinity_multisampling_early_stop_delta": params.get("affinity_multisampling_early_stop_delta", 0.02),
+            "affinity_multisampling_early_stop_std": params.get("affinity_multisampling_early_stop_std", 0.04),
+            "affinity_multisampling_early_stop_patience": params.get("affinity_multisampling_early_stop_patience", 1),
+            "affinity_multisampling_robust_outlier_filter": params.get("affinity_multisampling_robust_outlier_filter", True),
+            "affinity_multisampling_robust_outlier_zmax": params.get("affinity_multisampling_robust_outlier_zmax", 3.5),
+            "affinity_multisampling_bootstrap_samples": params.get("affinity_multisampling_bootstrap_samples", 300),
+            "external_boltz_patch_enabled": params.get("external_boltz_patch_enabled", False),
+            "external_boltz_patch_mode": params.get("external_boltz_patch_mode", "mutation_aware_v2"),
+            "external_boltz_patch_weight_floor": params.get("external_boltz_patch_weight_floor", 0.05),
+            "external_boltz_patch_entropy_alpha": params.get("external_boltz_patch_entropy_alpha", 0.20),
+            "external_boltz_patch_uncertainty_penalty": params.get("external_boltz_patch_uncertainty_penalty", 0.15),
+            "external_boltz_patch_min_confidence": params.get("external_boltz_patch_min_confidence", 0.35),
+            "use_potentials": params.get("use_potentials", False),
+            "method": params.get("method"),
             "max_msa_seqs": params.get("max_msa_seqs", 8192),
             "sampling_steps_affinity": params.get("sampling_steps_affinity", 200),
             "diffusion_samples_affinity": params.get("diffusion_samples_affinity", 5),
@@ -556,6 +1703,9 @@ def _create_result_entry(
             "max_retry_attempts": params.get("max_retry_attempts", 2),
             "retry_delay_base": params.get("retry_delay_base", 5),
             "template_cif_path": params.get("template_cif_path"),
+            "mutation_steering_config": params.get("mutation_steering_config"),
+            "use_cached_msa": params.get("use_cached_msa", False),
+            "enable_msa_cache": params.get("enable_msa_cache", True),
             "override": params.get("override", False),
             "prediction_timeout_seconds": params.get("prediction_timeout_seconds", 300),
         },
@@ -592,11 +1742,33 @@ def _persist_result_entry(
             print(f"[WARN] {message}")
 
 
-def execute_screening_job(job: ScreeningJob) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def execute_screening_job(job: ScreeningJob, worker_id: int = 0) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     params = job.parameters or {}
     ligand_smiles = "" if job.structure_only else job.smiles
     ligand_display_name = "" if job.structure_only else job.drug_name
     start_time = time.time()
+    enable_msa_cache = bool(params.get("enable_msa_cache", True))
+    wt_sequence_for_msa_cache = params.get("wt_sequence_for_msa_cache")
+    msa_path, use_cached_msa = resolve_msa_cache_for_prediction(
+        protein_sequence=job.protein_sequence,
+        wt_sequence=wt_sequence_for_msa_cache,
+        enable_msa_cache=enable_msa_cache,
+    )
+    params["use_cached_msa"] = use_cached_msa
+    if msa_path:
+        params["msa_path"] = msa_path
+
+    queue_gpu_devices = params.get("queue_gpu_devices")
+    effective_cuda_visible_devices = params.get("cuda_visible_devices")
+    if (
+        params.get("accelerator", "gpu") == "gpu"
+        and isinstance(queue_gpu_devices, list)
+        and len(queue_gpu_devices) > 0
+    ):
+        selected_idx = int(worker_id) % len(queue_gpu_devices)
+        effective_cuda_visible_devices = str(queue_gpu_devices[selected_idx])
+        params["cuda_visible_devices"] = effective_cuda_visible_devices
+        params["devices"] = 1
 
     boltz_results, success, error_message = run_boltz_with_retry(
         workspace_name=job.workspace_name,
@@ -615,6 +1787,27 @@ def execute_screening_job(job: ScreeningJob) -> Tuple[Dict[str, Any], Dict[str, 
         max_parallel_samples=params.get("max_parallel_samples", 5),
         step_scale=params.get("step_scale", 1.638),
         affinity_mw_correction=params.get("affinity_mw_correction", False),
+        external_boltz_patch_enabled=params.get("external_boltz_patch_enabled", False),
+        external_boltz_patch_mode=params.get("external_boltz_patch_mode", "mutation_aware_v2"),
+        external_boltz_patch_weight_floor=params.get("external_boltz_patch_weight_floor", 0.05),
+        external_boltz_patch_entropy_alpha=params.get("external_boltz_patch_entropy_alpha", 0.20),
+        external_boltz_patch_uncertainty_penalty=params.get("external_boltz_patch_uncertainty_penalty", 0.15),
+        external_boltz_patch_min_confidence=params.get("external_boltz_patch_min_confidence", 0.35),
+        affinity_multisampling_enabled=params.get("affinity_multisampling_enabled", False),
+        affinity_multisampling_profiles=params.get("affinity_multisampling_profiles"),
+        affinity_multisampling_settings=params.get("affinity_multisampling_settings"),
+        affinity_multisampling_refinement_steps=params.get("affinity_multisampling_refinement_steps"),
+        affinity_multisampling_aggregate_mode=params.get("affinity_multisampling_aggregate_mode", "median"),
+        affinity_multisampling_apply_aggregate=params.get("affinity_multisampling_apply_aggregate", True),
+        affinity_multisampling_early_stop_enabled=params.get("affinity_multisampling_early_stop_enabled", True),
+        affinity_multisampling_early_stop_min_points=params.get("affinity_multisampling_early_stop_min_points", 2),
+        affinity_multisampling_early_stop_delta=params.get("affinity_multisampling_early_stop_delta", 0.02),
+        affinity_multisampling_early_stop_std=params.get("affinity_multisampling_early_stop_std", 0.04),
+        affinity_multisampling_early_stop_patience=params.get("affinity_multisampling_early_stop_patience", 1),
+        affinity_multisampling_robust_outlier_filter=params.get("affinity_multisampling_robust_outlier_filter", True),
+        affinity_multisampling_robust_outlier_zmax=params.get("affinity_multisampling_robust_outlier_zmax", 3.5),
+        affinity_multisampling_bootstrap_samples=params.get("affinity_multisampling_bootstrap_samples", 300),
+        confidence_target=params.get("confidence_target", "balanced"),
         max_msa_seqs=params.get("max_msa_seqs", 8192),
         sampling_steps_affinity=params.get("sampling_steps_affinity", 200),
         diffusion_samples_affinity=params.get("diffusion_samples_affinity", 5),
@@ -628,7 +1821,16 @@ def execute_screening_job(job: ScreeningJob) -> Tuple[Dict[str, Any], Dict[str, 
         structure_only=job.structure_only,
         ptm_modifications=params.get("ptm_modifications"),
         prediction_timeout_seconds=params.get("prediction_timeout_seconds", 300),
+        accelerator=params.get("accelerator", "gpu"),
+        devices=params.get("devices", 1),
+        cuda_visible_devices=effective_cuda_visible_devices,
+        preprocessing_threads=params.get("preprocessing_threads", 1),
+        use_potentials=params.get("use_potentials", False),
+        method=params.get("method"),
         emit_streamlit_feedback=False,
+        msa_path=msa_path,
+        use_cached_msa=use_cached_msa,
+        enable_msa_cache=enable_msa_cache,
     )
     if not success or boltz_results is None:
         raise RuntimeError(error_message or "Boltz prediction failed")
@@ -650,6 +1852,8 @@ def execute_screening_job(job: ScreeningJob) -> Tuple[Dict[str, Any], Dict[str, 
     metadata = {
         "computation_time_seconds": computation_time,
         "timestamp": timestamp,
+        "worker_id": worker_id,
+        "worker_cuda_visible_devices": effective_cuda_visible_devices,
         "binding_pocket_constraints": params.get("binding_pocket_constraints"),
         "template_cif_path": params.get("template_cif_path"),
         "boltz_command": _build_boltz_command(yaml_filename, params),
@@ -668,18 +1872,19 @@ def execute_screening_job(job: ScreeningJob) -> Tuple[Dict[str, Any], Dict[str, 
     return result_entry, metadata
 
 
-def ensure_job_manager_executor() -> None:
+def ensure_job_manager_executor(worker_count: int = 1) -> None:
     if not USE_SCREENING_JOB_QUEUE:
         return
     manager = get_job_manager()
     if manager is None:
         return
     session_state = getattr(st, "session_state", None)
-    if session_state is not None and session_state.get(JOB_MANAGER_EXECUTOR_STATE_KEY):
-        return
-    manager.register_executor(execute_screening_job)
-    if session_state is not None:
-        session_state[JOB_MANAGER_EXECUTOR_STATE_KEY] = True
+    already_registered = bool(session_state is not None and session_state.get(JOB_MANAGER_EXECUTOR_STATE_KEY))
+    if not already_registered:
+        manager.register_executor(execute_screening_job)
+        if session_state is not None:
+            session_state[JOB_MANAGER_EXECUTOR_STATE_KEY] = True
+    manager.set_worker_count(max(1, int(worker_count)))
 
 
 def prepare_screening_jobs(
@@ -704,8 +1909,14 @@ def prepare_screening_jobs(
         "warnings": [],
     }
     seen_signatures: Set[str] = set()
+    wt_sequence_for_msa_cache = next(
+        (seq for name, seq in protein_sequences if str(name).strip().upper() == "WT"),
+        None
+    )
 
-    for protein_name, protein_seq in protein_sequences:
+    ordered_protein_sequences = _order_protein_sequences_for_screening(protein_sequences)
+
+    for protein_name, protein_seq in ordered_protein_sequences:
         if structure_only:
             if not should_evaluate_protein_drug_pair(protein_name, None, protein_drug_filter):
                 summary["skipped"] += 1
@@ -721,11 +1932,39 @@ def prepare_screening_jobs(
 
             params = copy.deepcopy(shared_params)
             params["cofactor_info"] = shared_params.get("cofactor_info")
-            params["binding_pocket_constraints"] = shared_params.get("binding_pocket_constraints")
+            params["mutation_steering_config"] = shared_params.get("mutation_steering_config")
+            params["binding_pocket_constraints"] = _resolve_mutation_steering_constraints(
+                protein_name=protein_name,
+                protein_sequence=protein_seq,
+                base_constraints=shared_params.get("binding_pocket_constraints"),
+                structure_only=structure_only,
+                mutation_steering_config=params.get("mutation_steering_config"),
+            )
             params["ptm_modifications"] = shared_params.get("ptm_modifications")
+            params["queue_gpu_devices"] = shared_params.get("queue_gpu_devices")
+            params["enable_msa_cache"] = bool(shared_params.get("enable_msa_cache", True))
+            params["structure_only"] = structure_only
+            if wt_sequence_for_msa_cache:
+                params["wt_sequence_for_msa_cache"] = wt_sequence_for_msa_cache
+
+            workspace_name, design_name, stable_job_id = _derive_stable_job_identifiers(
+                project_name=project_name,
+                protein_name=protein_name,
+                protein_sequence=protein_seq,
+                drug_name="" if structure_only else drug_name,
+                smiles="" if structure_only else drug_smiles_str,
+                structure_only=structure_only,
+                params=params,
+            )
 
             if use_existing_results:
-                existing_yaml_name = find_existing_screening_results(protein_name, drug_name, project_name)
+                existing_yaml_name = _find_existing_results_by_yaml_name(
+                    project_name=project_name,
+                    yaml_name=f"{workspace_name}_{design_name}",
+                    structure_only=structure_only,
+                )
+                if not existing_yaml_name:
+                    existing_yaml_name = find_existing_screening_results(protein_name, drug_name, project_name)
                 if existing_yaml_name:
                     project_dir = os.path.join(RESULTS_DIR, project_name)
                     yaml_filepath = os.path.join(project_dir, f"{existing_yaml_name}.yaml")
@@ -793,9 +2032,7 @@ def prepare_screening_jobs(
                 continue
 
             seen_signatures.add(signature)
-            workspace_name = _generate_workspace_name()
-            design_name = _sanitize_design_name(protein_name, drug_name if drug_name else None)
-            job_id = f"{project_name}:{uuid.uuid4().hex}"
+            job_id = stable_job_id
             job = ScreeningJob(
                 job_id=job_id,
                 project_name=project_name,
@@ -899,10 +2136,16 @@ def render_job_queue_status(project_name: str) -> Optional[Dict[str, Any]]:
     if timing_messages:
         st.caption(" • ".join(timing_messages))
 
-    active_job = summary.get("active_job")
-    if active_job:
-        ligand_display = active_job.drug_name or ("No ligand" if active_job.structure_only else "")
-        st.info(f"Processing: {active_job.protein_name}{' + ' + ligand_display if ligand_display else ''}")
+    active_jobs = summary.get("active_jobs") or []
+    if active_jobs:
+        labels: List[str] = []
+        for job in active_jobs[:3]:
+            ligand_display = job.drug_name or ("No ligand" if job.structure_only else "")
+            label = f"{job.protein_name}{' + ' + ligand_display if ligand_display else ''}"
+            labels.append(label)
+        if len(active_jobs) > 3:
+            labels.append(f"... and {len(active_jobs) - 3} more")
+        st.info(f"Processing: {' | '.join(labels)}")
 
     project_jobs = manager.get_project_jobs(project_name)
     if project_jobs:
@@ -1151,6 +2394,30 @@ def run_screening_prediction(
     max_parallel_samples: int = 5,
     step_scale: float = 1.638,
     affinity_mw_correction: bool = False,
+    affinity_consensus_enabled: bool = False,
+    affinity_consensus_mode: str = "weighted",
+    affinity_consensus_weight_floor: float = 0.05,
+    affinity_consensus_entropy_alpha: float = 0.2,
+    external_boltz_patch_enabled: bool = False,
+    external_boltz_patch_mode: str = "mutation_aware_v2",
+    external_boltz_patch_weight_floor: float = 0.05,
+    external_boltz_patch_entropy_alpha: float = 0.20,
+    external_boltz_patch_uncertainty_penalty: float = 0.15,
+    external_boltz_patch_min_confidence: float = 0.35,
+    affinity_multisampling_enabled: bool = False,
+    affinity_multisampling_profiles: Optional[List[Dict[str, int]]] = None,
+    affinity_multisampling_settings: Optional[List[str]] = None,
+    affinity_multisampling_refinement_steps: Optional[List[int]] = None,
+    affinity_multisampling_aggregate_mode: str = "median",
+    affinity_multisampling_apply_aggregate: bool = True,
+    affinity_multisampling_early_stop_enabled: bool = True,
+    affinity_multisampling_early_stop_min_points: int = 2,
+    affinity_multisampling_early_stop_delta: float = 0.02,
+    affinity_multisampling_early_stop_std: float = 0.04,
+    affinity_multisampling_early_stop_patience: int = 1,
+    affinity_multisampling_robust_outlier_filter: bool = True,
+    affinity_multisampling_robust_outlier_zmax: float = 3.5,
+    affinity_multisampling_bootstrap_samples: int = 300,
     max_msa_seqs: int = 8192,
     sampling_steps_affinity: int = 300,
     diffusion_samples_affinity: int = 7,
@@ -1165,6 +2432,15 @@ def run_screening_prediction(
     structure_only: bool = False,
     ptm_modifications: Optional[Dict] = None,
     prediction_timeout_seconds: int = 300,
+    enable_msa_cache: bool = True,
+    accelerator: str = "gpu",
+    devices: int = 1,
+    cuda_visible_devices: Optional[str] = None,
+    preprocessing_threads: int = 1,
+    enable_batch_execution: bool = True,
+    use_potentials: bool = False,
+    method: Optional[str] = None,
+    mutation_steering_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict], float]:
     """Run screening prediction using Boltz2."""
     results: List[Dict] = []
@@ -1186,10 +2462,97 @@ def run_screening_prediction(
     progress_bar = st.progress(0, text="Starting screening prediction...")
     current_job = 0
     existing_results_used = 0
-    new_computations = 0
     start_time = time.time()
+    wt_sequence_for_msa_cache = next(
+        (seq for name, seq in protein_sequences if str(name).strip().upper() == "WT"),
+        None
+    )
+    pending_jobs: List[Dict[str, Any]] = []
 
-    for protein_name, protein_seq in protein_sequences:
+    def build_failure_result(
+        protein_name: str,
+        protein_seq: str,
+        drug_name: str,
+        drug_smiles_str: str,
+        workspace_name: str,
+        design_name: str,
+        command_params: Dict[str, Any],
+        status: str = "Failed - Prediction error",
+    ) -> Dict[str, Any]:
+        return {
+            "protein_name": protein_name,
+            "drug_name": "" if structure_only else drug_name,
+            "protein_sequence": protein_seq,
+            "smiles": "" if structure_only else drug_smiles_str,
+            "ic50_um": None,
+            "pic50": None,
+            "affinity_probability": None,
+            "confidence": None,
+            "ptm": None,
+            "iptm": None,
+            "avg_plddt": None,
+            "status": status,
+            "workspace": workspace_name,
+            "design": design_name,
+            "cofactor_info": cofactor_info,
+            "boltz2_parameters": {
+                "use_gpu": use_gpu,
+                "accelerator": accelerator,
+                "devices": devices,
+                "cuda_visible_devices": cuda_visible_devices,
+                "preprocessing_threads": preprocessing_threads,
+                "recycling_steps": recycling_steps,
+                "sampling_steps": sampling_steps,
+                "diffusion_samples": diffusion_samples,
+                "max_parallel_samples": max_parallel_samples,
+                "step_scale": step_scale,
+                "affinity_mw_correction": affinity_mw_correction,
+                "affinity_consensus_enabled": affinity_consensus_enabled,
+                "affinity_consensus_mode": affinity_consensus_mode,
+                "affinity_consensus_weight_floor": affinity_consensus_weight_floor,
+                "affinity_consensus_entropy_alpha": affinity_consensus_entropy_alpha,
+                "external_boltz_patch_enabled": external_boltz_patch_enabled,
+                "external_boltz_patch_mode": external_boltz_patch_mode,
+                "external_boltz_patch_weight_floor": external_boltz_patch_weight_floor,
+                "external_boltz_patch_entropy_alpha": external_boltz_patch_entropy_alpha,
+                "external_boltz_patch_uncertainty_penalty": external_boltz_patch_uncertainty_penalty,
+                "external_boltz_patch_min_confidence": external_boltz_patch_min_confidence,
+                "affinity_multisampling_enabled": affinity_multisampling_enabled,
+                "affinity_multisampling_profiles": affinity_multisampling_profiles,
+                "affinity_multisampling_settings": affinity_multisampling_settings,
+                "affinity_multisampling_refinement_steps": affinity_multisampling_refinement_steps,
+                "affinity_multisampling_aggregate_mode": affinity_multisampling_aggregate_mode,
+                "affinity_multisampling_apply_aggregate": affinity_multisampling_apply_aggregate,
+                "affinity_multisampling_early_stop_enabled": affinity_multisampling_early_stop_enabled,
+                "affinity_multisampling_early_stop_min_points": affinity_multisampling_early_stop_min_points,
+                "affinity_multisampling_early_stop_delta": affinity_multisampling_early_stop_delta,
+                "affinity_multisampling_early_stop_std": affinity_multisampling_early_stop_std,
+                "affinity_multisampling_early_stop_patience": affinity_multisampling_early_stop_patience,
+                "affinity_multisampling_robust_outlier_filter": affinity_multisampling_robust_outlier_filter,
+                "affinity_multisampling_robust_outlier_zmax": affinity_multisampling_robust_outlier_zmax,
+                "affinity_multisampling_bootstrap_samples": affinity_multisampling_bootstrap_samples,
+                "confidence_target": "balanced",
+                "use_potentials": use_potentials,
+                "method": method,
+                "max_msa_seqs": max_msa_seqs,
+                "sampling_steps_affinity": sampling_steps_affinity,
+                "diffusion_samples_affinity": diffusion_samples_affinity,
+                "subsample_msa": subsample_msa,
+                "num_subsampled_msa": num_subsampled_msa,
+                "enable_retries": enable_retries,
+                "max_retry_attempts": max_retry_attempts,
+                "retry_delay_base": retry_delay_base,
+                "template_cif_path": template_cif_path,
+                "use_cached_msa": command_params.get("use_cached_msa", False),
+                "enable_msa_cache": enable_msa_cache,
+                "override": command_params["override"],
+                "prediction_timeout_seconds": prediction_timeout_seconds,
+            },
+        }
+
+    ordered_protein_sequences = _order_protein_sequences_for_screening(protein_sequences)
+
+    for protein_name, protein_seq in ordered_protein_sequences:
         combos = [("", "")] if structure_only else drug_smiles
         for drug_name, drug_smiles_str in combos:
             if structure_only:
@@ -1215,6 +2578,10 @@ def run_screening_prediction(
 
             command_params = {
                 "use_gpu": use_gpu,
+                "accelerator": accelerator,
+                "devices": devices,
+                "cuda_visible_devices": cuda_visible_devices,
+                "preprocessing_threads": preprocessing_threads,
                 "override": not use_existing_results,
                 "recycling_steps": recycling_steps,
                 "sampling_steps": sampling_steps,
@@ -1222,6 +2589,32 @@ def run_screening_prediction(
                 "max_parallel_samples": max_parallel_samples,
                 "step_scale": step_scale,
                 "affinity_mw_correction": affinity_mw_correction,
+                "affinity_consensus_enabled": affinity_consensus_enabled,
+                "affinity_consensus_mode": affinity_consensus_mode,
+                "affinity_consensus_weight_floor": affinity_consensus_weight_floor,
+                "affinity_consensus_entropy_alpha": affinity_consensus_entropy_alpha,
+                "external_boltz_patch_enabled": external_boltz_patch_enabled,
+                "external_boltz_patch_mode": external_boltz_patch_mode,
+                "external_boltz_patch_weight_floor": external_boltz_patch_weight_floor,
+                "external_boltz_patch_entropy_alpha": external_boltz_patch_entropy_alpha,
+                "external_boltz_patch_uncertainty_penalty": external_boltz_patch_uncertainty_penalty,
+                "external_boltz_patch_min_confidence": external_boltz_patch_min_confidence,
+                "affinity_multisampling_enabled": affinity_multisampling_enabled,
+                "affinity_multisampling_profiles": affinity_multisampling_profiles,
+                "affinity_multisampling_settings": affinity_multisampling_settings,
+                "affinity_multisampling_refinement_steps": affinity_multisampling_refinement_steps,
+                "affinity_multisampling_aggregate_mode": affinity_multisampling_aggregate_mode,
+                "affinity_multisampling_apply_aggregate": affinity_multisampling_apply_aggregate,
+                "affinity_multisampling_early_stop_enabled": affinity_multisampling_early_stop_enabled,
+                "affinity_multisampling_early_stop_min_points": affinity_multisampling_early_stop_min_points,
+                "affinity_multisampling_early_stop_delta": affinity_multisampling_early_stop_delta,
+                "affinity_multisampling_early_stop_std": affinity_multisampling_early_stop_std,
+                "affinity_multisampling_early_stop_patience": affinity_multisampling_early_stop_patience,
+                "affinity_multisampling_robust_outlier_filter": affinity_multisampling_robust_outlier_filter,
+                "affinity_multisampling_robust_outlier_zmax": affinity_multisampling_robust_outlier_zmax,
+                "affinity_multisampling_bootstrap_samples": affinity_multisampling_bootstrap_samples,
+                "use_potentials": use_potentials,
+                "method": method,
                 "max_msa_seqs": max_msa_seqs,
                 "sampling_steps_affinity": sampling_steps_affinity,
                 "diffusion_samples_affinity": diffusion_samples_affinity,
@@ -1231,21 +2624,48 @@ def run_screening_prediction(
                 "subsample_msa": subsample_msa,
                 "num_subsampled_msa": num_subsampled_msa,
                 "template_cif_path": template_cif_path,
-                "binding_pocket_constraints": binding_pocket_constraints,
+                "mutation_steering_config": mutation_steering_config,
+                "binding_pocket_constraints": _resolve_mutation_steering_constraints(
+                    protein_name=protein_name,
+                    protein_sequence=protein_seq,
+                    base_constraints=binding_pocket_constraints,
+                    structure_only=structure_only,
+                    mutation_steering_config=mutation_steering_config,
+                ),
                 "cofactor_info": cofactor_info,
                 "ptm_modifications": ptm_modifications,
+                "structure_only": structure_only,
                 "prediction_timeout_seconds": prediction_timeout_seconds,
+                "enable_msa_cache": enable_msa_cache,
             }
+            if wt_sequence_for_msa_cache:
+                command_params["wt_sequence_for_msa_cache"] = wt_sequence_for_msa_cache
 
-            workspace_name = _generate_workspace_name()
-            design_name = _sanitize_design_name(protein_name, drug_name if drug_name else None)
+            workspace_name, design_name, stable_job_id = _derive_stable_job_identifiers(
+                project_name=project_name,
+                protein_name=protein_name,
+                protein_sequence=protein_seq,
+                drug_name="" if structure_only else drug_name,
+                smiles="" if structure_only else drug_smiles_str,
+                structure_only=structure_only,
+                params=command_params,
+            )
             boltz_results = None
-            ran_prediction = False
-            job_elapsed: Optional[float] = None
 
             if use_existing_results:
                 try:
-                    existing_yaml_name = find_existing_screening_results(protein_name, drug_name if not structure_only else "", project_name)
+                    deterministic_yaml_name = f"{workspace_name}_{design_name}"
+                    existing_yaml_name = _find_existing_results_by_yaml_name(
+                        project_name=project_name,
+                        yaml_name=deterministic_yaml_name,
+                        structure_only=structure_only,
+                    )
+                    if not existing_yaml_name:
+                        existing_yaml_name = find_existing_screening_results(
+                            protein_name,
+                            drug_name if not structure_only else "",
+                            project_name,
+                        )
                 except Exception:
                     existing_yaml_name = None
                 if existing_yaml_name:
@@ -1272,114 +2692,427 @@ def run_screening_prediction(
                     except Exception as exc:
                         st.warning(f"Failed to load existing results for {job_label}: {str(exc)[:100]}")
 
-            if boltz_results is None:
-                ran_prediction = True
-                new_computations += 1
-                job_start_time = time.time()
-                ligand_smiles_value = "" if structure_only else drug_smiles_str
-                boltz_results, success, error_message = run_boltz_with_retry(
-                    workspace_name=workspace_name,
-                    design_name=design_name,
-                    protein_sequence=protein_seq,
-                    ligand_smiles=ligand_smiles_value,
-                    project_name=project_name,
-                    protein_display_name=protein_name,
-                    ligand_display_name=drug_name if not structure_only else "",
-                    use_gpu=use_gpu,
-                    binding_pocket_constraints=binding_pocket_constraints,
-                    override=command_params["override"],
-                    recycling_steps=recycling_steps,
-                    sampling_steps=sampling_steps,
-                    diffusion_samples=diffusion_samples,
-                    max_parallel_samples=max_parallel_samples,
-                    step_scale=step_scale,
-                    affinity_mw_correction=affinity_mw_correction,
-                    max_msa_seqs=max_msa_seqs,
-                    sampling_steps_affinity=sampling_steps_affinity,
-                    diffusion_samples_affinity=diffusion_samples_affinity,
-                    cofactor_info=cofactor_info,
-                    enable_retries=enable_retries,
-                    max_retry_attempts=max_retry_attempts,
-                    retry_delay_base=retry_delay_base,
-                    subsample_msa=subsample_msa,
-                    num_subsampled_msa=num_subsampled_msa,
-                    template_cif_path=template_cif_path,
-                    structure_only=structure_only,
-                    ptm_modifications=ptm_modifications,
-                    prediction_timeout_seconds=prediction_timeout_seconds,
-                )
-                job_elapsed = time.time() - job_start_time
-                if not success:
-                    st.error(f"All prediction attempts failed for {job_label}: {error_message[:100]}")
-                    boltz_results = None
-
-            command_params["cofactor_info"] = cofactor_info
-            result_drug_name = "" if structure_only else drug_name
-            result_smiles = "" if structure_only else drug_smiles_str
-
             if boltz_results:
                 result = _create_result_entry(
                     protein_name=protein_name,
                     protein_sequence=protein_seq,
-                    drug_name=result_drug_name,
-                    smiles=result_smiles,
+                    drug_name="" if structure_only else drug_name,
+                    smiles="" if structure_only else drug_smiles_str,
                     workspace_name=workspace_name,
                     design_name=design_name,
                     boltz_results=boltz_results,
                     params=command_params,
                 )
+                results.append(result)
             else:
-                result = {
-                    "protein_name": protein_name,
-                    "drug_name": result_drug_name,
-                    "protein_sequence": protein_seq,
-                    "smiles": result_smiles,
-                    "ic50_um": None,
-                    "pic50": None,
-                    "affinity_probability": None,
-                    "confidence": None,
-                    "ptm": None,
-                    "iptm": None,
-                    "avg_plddt": None,
-                    "status": "Failed - All retry attempts exhausted",
-                    "workspace": workspace_name,
-                    "design": design_name,
-                    "cofactor_info": cofactor_info,
-                    "boltz2_parameters": {
-                        "use_gpu": use_gpu,
-                        "recycling_steps": recycling_steps,
-                        "sampling_steps": sampling_steps,
-                        "diffusion_samples": diffusion_samples,
-                        "max_parallel_samples": max_parallel_samples,
-                        "step_scale": step_scale,
-                        "affinity_mw_correction": affinity_mw_correction,
-                        "max_msa_seqs": max_msa_seqs,
-                        "sampling_steps_affinity": sampling_steps_affinity,
-                        "diffusion_samples_affinity": diffusion_samples_affinity,
-                        "subsample_msa": subsample_msa,
-                        "num_subsampled_msa": num_subsampled_msa,
-                        "enable_retries": enable_retries,
-                        "max_retry_attempts": max_retry_attempts,
-                        "retry_delay_base": retry_delay_base,
-                        "template_cif_path": template_cif_path,
-                        "override": command_params["override"],
-                        "prediction_timeout_seconds": prediction_timeout_seconds,
-                    },
-                }
-
-            results.append(result)
-
-            if ran_prediction:
-                yaml_filename = f"{workspace_name}_{design_name}.yaml"
-                boltz_command = _build_boltz_command(yaml_filename, command_params)
-                _persist_result_entry(
-                    project_name,
-                    result,
-                    job_elapsed,
-                    binding_pocket_constraints=binding_pocket_constraints,
-                    template_cif_path=template_cif_path,
-                    boltz_command=boltz_command,
+                pending_jobs.append(
+                    {
+                        "stable_job_id": stable_job_id,
+                        "protein_name": protein_name,
+                        "protein_sequence": protein_seq,
+                        "drug_name": drug_name,
+                        "drug_smiles": drug_smiles_str,
+                        "workspace_name": workspace_name,
+                        "design_name": design_name,
+                        "command_params": command_params,
+                    }
                 )
+
+    new_computations = len(pending_jobs)
+
+    # Seed WT MSA cache once if needed (mutation mode), then batch remaining jobs.
+    if pending_jobs:
+        has_mutant_jobs = any(
+            (wt_sequence_for_msa_cache and job["protein_sequence"] != wt_sequence_for_msa_cache)
+            for job in pending_jobs
+        )
+        if enable_msa_cache and wt_sequence_for_msa_cache and has_mutant_jobs:
+            wt_msa_path, wt_cached = resolve_msa_cache_for_prediction(
+                protein_sequence=wt_sequence_for_msa_cache,
+                wt_sequence=None,
+                enable_msa_cache=enable_msa_cache,
+            )
+            if not wt_cached:
+                wt_seed_idx = next(
+                    (i for i, job in enumerate(pending_jobs) if job["protein_sequence"] == wt_sequence_for_msa_cache),
+                    None,
+                )
+                if wt_seed_idx is not None:
+                    wt_seed_job = pending_jobs.pop(wt_seed_idx)
+                    cp = wt_seed_job["command_params"]
+                    seed_start = time.time()
+                    boltz_results, success, error_message = run_boltz_with_retry(
+                        workspace_name=wt_seed_job["workspace_name"],
+                        design_name=wt_seed_job["design_name"],
+                        protein_sequence=wt_seed_job["protein_sequence"],
+                        ligand_smiles="" if structure_only else wt_seed_job["drug_smiles"],
+                        project_name=project_name,
+                        protein_display_name=wt_seed_job["protein_name"],
+                        ligand_display_name="" if structure_only else wt_seed_job["drug_name"],
+                        use_gpu=use_gpu,
+                        binding_pocket_constraints=cp.get("binding_pocket_constraints"),
+                        override=cp["override"],
+                        recycling_steps=cp.get("recycling_steps", recycling_steps),
+                        sampling_steps=cp.get("sampling_steps", sampling_steps),
+                        diffusion_samples=cp.get("diffusion_samples", diffusion_samples),
+                        max_parallel_samples=cp.get("max_parallel_samples", max_parallel_samples),
+                        step_scale=cp.get("step_scale", step_scale),
+                        affinity_mw_correction=cp.get("affinity_mw_correction", affinity_mw_correction),
+                        external_boltz_patch_enabled=cp.get("external_boltz_patch_enabled", False),
+                        external_boltz_patch_mode=cp.get("external_boltz_patch_mode", "mutation_aware_v2"),
+                        external_boltz_patch_weight_floor=cp.get("external_boltz_patch_weight_floor", 0.05),
+                        external_boltz_patch_entropy_alpha=cp.get("external_boltz_patch_entropy_alpha", 0.20),
+                        external_boltz_patch_uncertainty_penalty=cp.get("external_boltz_patch_uncertainty_penalty", 0.15),
+                        external_boltz_patch_min_confidence=cp.get("external_boltz_patch_min_confidence", 0.35),
+                        affinity_multisampling_enabled=cp.get("affinity_multisampling_enabled", False),
+                        affinity_multisampling_profiles=cp.get("affinity_multisampling_profiles"),
+                        affinity_multisampling_settings=cp.get("affinity_multisampling_settings"),
+                        affinity_multisampling_refinement_steps=cp.get("affinity_multisampling_refinement_steps"),
+                        affinity_multisampling_aggregate_mode=cp.get("affinity_multisampling_aggregate_mode", "median"),
+                        affinity_multisampling_apply_aggregate=cp.get("affinity_multisampling_apply_aggregate", True),
+                        affinity_multisampling_early_stop_enabled=cp.get("affinity_multisampling_early_stop_enabled", True),
+                        affinity_multisampling_early_stop_min_points=cp.get("affinity_multisampling_early_stop_min_points", 2),
+                        affinity_multisampling_early_stop_delta=cp.get("affinity_multisampling_early_stop_delta", 0.02),
+                        affinity_multisampling_early_stop_std=cp.get("affinity_multisampling_early_stop_std", 0.04),
+                        affinity_multisampling_early_stop_patience=cp.get("affinity_multisampling_early_stop_patience", 1),
+                        affinity_multisampling_robust_outlier_filter=cp.get("affinity_multisampling_robust_outlier_filter", True),
+                        affinity_multisampling_robust_outlier_zmax=cp.get("affinity_multisampling_robust_outlier_zmax", 3.5),
+                        affinity_multisampling_bootstrap_samples=cp.get("affinity_multisampling_bootstrap_samples", 300),
+                        confidence_target=cp.get("confidence_target", "balanced"),
+                        max_msa_seqs=cp.get("max_msa_seqs", max_msa_seqs),
+                        sampling_steps_affinity=cp.get("sampling_steps_affinity", sampling_steps_affinity),
+                        diffusion_samples_affinity=cp.get("diffusion_samples_affinity", diffusion_samples_affinity),
+                        cofactor_info=cofactor_info,
+                        enable_retries=cp.get("enable_retries", enable_retries),
+                        max_retry_attempts=cp.get("max_retry_attempts", max_retry_attempts),
+                        retry_delay_base=cp.get("retry_delay_base", retry_delay_base),
+                        subsample_msa=cp.get("subsample_msa", subsample_msa),
+                        num_subsampled_msa=cp.get("num_subsampled_msa", num_subsampled_msa),
+                        template_cif_path=cp.get("template_cif_path", template_cif_path),
+                        structure_only=structure_only,
+                        ptm_modifications=ptm_modifications,
+                        prediction_timeout_seconds=cp.get("prediction_timeout_seconds", prediction_timeout_seconds),
+                        accelerator=cp.get("accelerator", accelerator),
+                        devices=cp.get("devices", devices),
+                        cuda_visible_devices=cp.get("cuda_visible_devices", cuda_visible_devices),
+                        preprocessing_threads=cp.get("preprocessing_threads", preprocessing_threads),
+                        use_potentials=cp.get("use_potentials", False),
+                        method=cp.get("method"),
+                        msa_path=None,
+                        use_cached_msa=False,
+                        enable_msa_cache=enable_msa_cache,
+                    )
+                    seed_elapsed = time.time() - seed_start
+                    if success and boltz_results:
+                        seed_result = _create_result_entry(
+                            protein_name=wt_seed_job["protein_name"],
+                            protein_sequence=wt_seed_job["protein_sequence"],
+                            drug_name="" if structure_only else wt_seed_job["drug_name"],
+                            smiles="" if structure_only else wt_seed_job["drug_smiles"],
+                            workspace_name=wt_seed_job["workspace_name"],
+                            design_name=wt_seed_job["design_name"],
+                            boltz_results=boltz_results,
+                            params=cp,
+                        )
+                    else:
+                        seed_result = build_failure_result(
+                            protein_name=wt_seed_job["protein_name"],
+                            protein_seq=wt_seed_job["protein_sequence"],
+                            drug_name=wt_seed_job["drug_name"],
+                            drug_smiles_str=wt_seed_job["drug_smiles"],
+                            workspace_name=wt_seed_job["workspace_name"],
+                            design_name=wt_seed_job["design_name"],
+                            command_params=cp,
+                            status=f"Failed - {str(error_message)[:120]}",
+                        )
+                    results.append(seed_result)
+                    _persist_result_entry(
+                        project_name,
+                        seed_result,
+                        seed_elapsed,
+                        binding_pocket_constraints=cp.get("binding_pocket_constraints"),
+                        template_cif_path=template_cif_path,
+                        boltz_command=_build_boltz_command(
+                            f"{wt_seed_job['workspace_name']}_{wt_seed_job['design_name']}.yaml",
+                            cp,
+                        ),
+                    )
+
+        # Resolve per-job MSA usage before batch or individual fallback.
+        for job in pending_jobs:
+            cp = job["command_params"]
+            msa_path, use_cached_msa = resolve_msa_cache_for_prediction(
+                protein_sequence=job["protein_sequence"],
+                wt_sequence=wt_sequence_for_msa_cache,
+                enable_msa_cache=enable_msa_cache,
+            )
+            cp["use_cached_msa"] = use_cached_msa
+            if msa_path:
+                cp["msa_path"] = msa_path
+                job["msa_path"] = msa_path
+            else:
+                job["msa_path"] = None
+
+        remaining_jobs = pending_jobs
+        fallback_jobs: List[Dict[str, Any]] = []
+
+        if enable_batch_execution and len(remaining_jobs) >= 2:
+            if any(bool(job["command_params"].get("affinity_multisampling_enabled", False)) for job in remaining_jobs):
+                fallback_jobs = remaining_jobs
+                st.info(
+                    "Affinity multi-sampling is enabled; running per-job mode to reuse each job's "
+                    "cached structure and execute setting sweeps."
+                )
+            else:
+                batch_compat_keys = [
+                    "accelerator",
+                    "devices",
+                    "cuda_visible_devices",
+                    "preprocessing_threads",
+                    "override",
+                    "recycling_steps",
+                    "sampling_steps",
+                    "diffusion_samples",
+                    "max_parallel_samples",
+                    "step_scale",
+                    "affinity_mw_correction",
+                    "external_boltz_patch_enabled",
+                    "external_boltz_patch_mode",
+                    "external_boltz_patch_weight_floor",
+                    "external_boltz_patch_entropy_alpha",
+                    "external_boltz_patch_uncertainty_penalty",
+                    "external_boltz_patch_min_confidence",
+                    "affinity_multisampling_enabled",
+                    "affinity_multisampling_profiles",
+                    "affinity_multisampling_settings",
+                    "affinity_multisampling_refinement_steps",
+                    "affinity_multisampling_aggregate_mode",
+                    "affinity_multisampling_apply_aggregate",
+                    "affinity_multisampling_early_stop_enabled",
+                    "affinity_multisampling_early_stop_min_points",
+                    "affinity_multisampling_early_stop_delta",
+                    "affinity_multisampling_early_stop_std",
+                    "affinity_multisampling_early_stop_patience",
+                    "affinity_multisampling_robust_outlier_filter",
+                    "affinity_multisampling_robust_outlier_zmax",
+                    "affinity_multisampling_bootstrap_samples",
+                    "use_potentials",
+                    "method",
+                    "max_msa_seqs",
+                    "sampling_steps_affinity",
+                    "diffusion_samples_affinity",
+                    "subsample_msa",
+                    "num_subsampled_msa",
+                ]
+                unique_param_signatures = {
+                    tuple(_normalize_for_hash(job["command_params"].get(k)) for k in batch_compat_keys)
+                    for job in remaining_jobs
+                }
+                if len(unique_param_signatures) > 1:
+                    fallback_jobs = remaining_jobs
+                    st.info(
+                        "Adaptive sampling produced heterogeneous per-job settings; "
+                        "running per-job mode instead of single batch invocation."
+                    )
+                else:
+                    project_dir = os.path.join(RESULTS_DIR, project_name)
+                    batch_id = f"batch_inputs_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+                    batch_input_dir = os.path.join(project_dir, batch_id)
+                    os.makedirs(batch_input_dir, exist_ok=True)
+
+                    any_job_needs_msa_server = any(not j["command_params"].get("use_cached_msa", False) for j in remaining_jobs)
+                    for job in remaining_jobs:
+                        cp = job["command_params"]
+                        create_screening_boltz_yaml(
+                            workspace_name=job["workspace_name"],
+                            design_name=job["design_name"],
+                            protein_sequence=job["protein_sequence"],
+                            ligand_smiles="" if structure_only else job["drug_smiles"],
+                            project_name=project_name,
+                            binding_pocket_constraints=cp.get("binding_pocket_constraints"),
+                            cofactor_info=cofactor_info,
+                            template_cif_path=template_cif_path,
+                            structure_only=structure_only,
+                            ptm_modifications=ptm_modifications,
+                            msa_path=job.get("msa_path"),
+                            target_directory=batch_input_dir,
+                        )
+
+                    batch_start = time.time()
+                    batch_command_params = remaining_jobs[0]["command_params"] if remaining_jobs else {}
+                    try:
+                        utils.run_boltz_batch_prediction(
+                            input_path=batch_input_dir,
+                            working_dir=project_dir,
+                            use_msa_server=any_job_needs_msa_server,
+                            accelerator=batch_command_params.get("accelerator", accelerator),
+                            devices=batch_command_params.get("devices", devices),
+                            cuda_visible_devices=batch_command_params.get("cuda_visible_devices", cuda_visible_devices),
+                            preprocessing_threads=batch_command_params.get("preprocessing_threads", preprocessing_threads),
+                            override=batch_command_params.get("override", not use_existing_results),
+                            recycling_steps=batch_command_params.get("recycling_steps", recycling_steps),
+                            sampling_steps=batch_command_params.get("sampling_steps", sampling_steps),
+                            diffusion_samples=batch_command_params.get("diffusion_samples", diffusion_samples),
+                            max_parallel_samples=batch_command_params.get("max_parallel_samples", max_parallel_samples),
+                            step_scale=batch_command_params.get("step_scale", step_scale),
+                            affinity_mw_correction=batch_command_params.get("affinity_mw_correction", affinity_mw_correction),
+                            use_potentials=batch_command_params.get("use_potentials", False),
+                            method=batch_command_params.get("method"),
+                            external_boltz_patch_enabled=batch_command_params.get("external_boltz_patch_enabled", False),
+                            external_boltz_patch_mode=batch_command_params.get("external_boltz_patch_mode", "mutation_aware_v2"),
+                            external_boltz_patch_weight_floor=batch_command_params.get("external_boltz_patch_weight_floor", 0.05),
+                            external_boltz_patch_entropy_alpha=batch_command_params.get("external_boltz_patch_entropy_alpha", 0.20),
+                            external_boltz_patch_uncertainty_penalty=batch_command_params.get("external_boltz_patch_uncertainty_penalty", 0.15),
+                            external_boltz_patch_min_confidence=batch_command_params.get("external_boltz_patch_min_confidence", 0.35),
+                            max_msa_seqs=batch_command_params.get("max_msa_seqs", max_msa_seqs),
+                            sampling_steps_affinity=batch_command_params.get("sampling_steps_affinity", sampling_steps_affinity),
+                            diffusion_samples_affinity=batch_command_params.get("diffusion_samples_affinity", diffusion_samples_affinity),
+                            subsample_msa=batch_command_params.get("subsample_msa", subsample_msa),
+                            num_subsampled_msa=batch_command_params.get("num_subsampled_msa", num_subsampled_msa),
+                            timeout=max(
+                                batch_command_params.get("prediction_timeout_seconds", prediction_timeout_seconds) * max(1, len(remaining_jobs)),
+                                batch_command_params.get("prediction_timeout_seconds", prediction_timeout_seconds),
+                            ),
+                        )
+                        batch_elapsed = time.time() - batch_start
+                        batch_output_root = os.path.join(project_dir, f"boltz_results_{batch_id}")
+                        batch_cmd = _build_boltz_batch_command(batch_id, batch_command_params, any_job_needs_msa_server)
+
+                        for job in remaining_jobs:
+                            yaml_name = f"{job['workspace_name']}_{job['design_name']}"
+                            parsed = utils.parse_boltz_results_from_output_root(
+                                batch_output_root,
+                                yaml_name,
+                                structure_only=structure_only,
+                            )
+                            if parsed:
+                                result = _create_result_entry(
+                                    protein_name=job["protein_name"],
+                                    protein_sequence=job["protein_sequence"],
+                                    drug_name="" if structure_only else job["drug_name"],
+                                    smiles="" if structure_only else job["drug_smiles"],
+                                    workspace_name=job["workspace_name"],
+                                    design_name=job["design_name"],
+                                    boltz_results=parsed,
+                                    params=job["command_params"],
+                                )
+                                results.append(result)
+                                _persist_result_entry(
+                                    project_name,
+                                    result,
+                                    batch_elapsed / max(len(remaining_jobs), 1),
+                                    binding_pocket_constraints=job["command_params"].get("binding_pocket_constraints"),
+                                    template_cif_path=template_cif_path,
+                                    boltz_command=batch_cmd,
+                                )
+                            else:
+                                fallback_jobs.append(job)
+                    except Exception as exc:
+                        st.warning(f"Batch execution failed, falling back to per-job execution: {str(exc)[:180]}")
+                        fallback_jobs = remaining_jobs
+        else:
+            fallback_jobs = remaining_jobs
+
+        # Fallback: run any unresolved jobs one-by-one with retry.
+        for job in fallback_jobs:
+            cp = job["command_params"]
+            job_start_time = time.time()
+            boltz_results, success, error_message = run_boltz_with_retry(
+                workspace_name=job["workspace_name"],
+                design_name=job["design_name"],
+                protein_sequence=job["protein_sequence"],
+                ligand_smiles="" if structure_only else job["drug_smiles"],
+                project_name=project_name,
+                protein_display_name=job["protein_name"],
+                ligand_display_name="" if structure_only else job["drug_name"],
+                use_gpu=use_gpu,
+                binding_pocket_constraints=cp.get("binding_pocket_constraints"),
+                override=cp["override"],
+                recycling_steps=cp.get("recycling_steps", recycling_steps),
+                sampling_steps=cp.get("sampling_steps", sampling_steps),
+                diffusion_samples=cp.get("diffusion_samples", diffusion_samples),
+                max_parallel_samples=cp.get("max_parallel_samples", max_parallel_samples),
+                step_scale=cp.get("step_scale", step_scale),
+                affinity_mw_correction=cp.get("affinity_mw_correction", affinity_mw_correction),
+                external_boltz_patch_enabled=cp.get("external_boltz_patch_enabled", False),
+                external_boltz_patch_mode=cp.get("external_boltz_patch_mode", "mutation_aware_v2"),
+                external_boltz_patch_weight_floor=cp.get("external_boltz_patch_weight_floor", 0.05),
+                external_boltz_patch_entropy_alpha=cp.get("external_boltz_patch_entropy_alpha", 0.20),
+                external_boltz_patch_uncertainty_penalty=cp.get("external_boltz_patch_uncertainty_penalty", 0.15),
+                external_boltz_patch_min_confidence=cp.get("external_boltz_patch_min_confidence", 0.35),
+                affinity_multisampling_enabled=cp.get("affinity_multisampling_enabled", False),
+                affinity_multisampling_profiles=cp.get("affinity_multisampling_profiles"),
+                affinity_multisampling_settings=cp.get("affinity_multisampling_settings"),
+                affinity_multisampling_refinement_steps=cp.get("affinity_multisampling_refinement_steps"),
+                affinity_multisampling_aggregate_mode=cp.get("affinity_multisampling_aggregate_mode", "median"),
+                affinity_multisampling_apply_aggregate=cp.get("affinity_multisampling_apply_aggregate", True),
+                affinity_multisampling_early_stop_enabled=cp.get("affinity_multisampling_early_stop_enabled", True),
+                affinity_multisampling_early_stop_min_points=cp.get("affinity_multisampling_early_stop_min_points", 2),
+                affinity_multisampling_early_stop_delta=cp.get("affinity_multisampling_early_stop_delta", 0.02),
+                affinity_multisampling_early_stop_std=cp.get("affinity_multisampling_early_stop_std", 0.04),
+                affinity_multisampling_early_stop_patience=cp.get("affinity_multisampling_early_stop_patience", 1),
+                affinity_multisampling_robust_outlier_filter=cp.get("affinity_multisampling_robust_outlier_filter", True),
+                affinity_multisampling_robust_outlier_zmax=cp.get("affinity_multisampling_robust_outlier_zmax", 3.5),
+                affinity_multisampling_bootstrap_samples=cp.get("affinity_multisampling_bootstrap_samples", 300),
+                confidence_target=cp.get("confidence_target", "balanced"),
+                max_msa_seqs=cp.get("max_msa_seqs", max_msa_seqs),
+                sampling_steps_affinity=cp.get("sampling_steps_affinity", sampling_steps_affinity),
+                diffusion_samples_affinity=cp.get("diffusion_samples_affinity", diffusion_samples_affinity),
+                cofactor_info=cofactor_info,
+                enable_retries=cp.get("enable_retries", enable_retries),
+                max_retry_attempts=cp.get("max_retry_attempts", max_retry_attempts),
+                retry_delay_base=cp.get("retry_delay_base", retry_delay_base),
+                subsample_msa=cp.get("subsample_msa", subsample_msa),
+                num_subsampled_msa=cp.get("num_subsampled_msa", num_subsampled_msa),
+                template_cif_path=cp.get("template_cif_path", template_cif_path),
+                structure_only=structure_only,
+                ptm_modifications=ptm_modifications,
+                prediction_timeout_seconds=cp.get("prediction_timeout_seconds", prediction_timeout_seconds),
+                accelerator=cp.get("accelerator", accelerator),
+                devices=cp.get("devices", devices),
+                cuda_visible_devices=cp.get("cuda_visible_devices", cuda_visible_devices),
+                preprocessing_threads=cp.get("preprocessing_threads", preprocessing_threads),
+                use_potentials=cp.get("use_potentials", False),
+                method=cp.get("method"),
+                msa_path=job.get("msa_path"),
+                use_cached_msa=cp.get("use_cached_msa", False),
+                enable_msa_cache=cp.get("enable_msa_cache", enable_msa_cache),
+            )
+            job_elapsed = time.time() - job_start_time
+            if success and boltz_results:
+                result = _create_result_entry(
+                    protein_name=job["protein_name"],
+                    protein_sequence=job["protein_sequence"],
+                    drug_name="" if structure_only else job["drug_name"],
+                    smiles="" if structure_only else job["drug_smiles"],
+                    workspace_name=job["workspace_name"],
+                    design_name=job["design_name"],
+                    boltz_results=boltz_results,
+                    params=cp,
+                )
+            else:
+                result = build_failure_result(
+                    protein_name=job["protein_name"],
+                    protein_seq=job["protein_sequence"],
+                    drug_name=job["drug_name"],
+                    drug_smiles_str=job["drug_smiles"],
+                    workspace_name=job["workspace_name"],
+                    design_name=job["design_name"],
+                    command_params=cp,
+                    status=f"Failed - {str(error_message)[:120]}",
+                )
+            results.append(result)
+            _persist_result_entry(
+                project_name,
+                result,
+                job_elapsed,
+                binding_pocket_constraints=cp.get("binding_pocket_constraints"),
+                template_cif_path=template_cif_path,
+                boltz_command=_build_boltz_command(
+                    f"{job['workspace_name']}_{job['design_name']}.yaml",
+                    cp,
+                ),
+            )
 
     computation_time = time.time() - start_time
     progress_bar.empty()
@@ -1428,6 +3161,95 @@ def display_results_table(results: List[Dict]):
             return "background-color: lightcoral"
         else:
             return "background-color: lightyellow"
+
+    def _to_float_local(value):
+        try:
+            if value is None:
+                return None
+            parsed = float(value)
+            if np.isfinite(parsed):
+                return parsed
+            return None
+        except Exception:
+            return None
+
+    has_consensus_values = (
+        "affinity_pred_value_consensus" in df.columns
+        and pd.to_numeric(df["affinity_pred_value_consensus"], errors="coerce").notna().any()
+    )
+    has_raw_values = (
+        "affinity_pred_value_raw" in df.columns
+        and pd.to_numeric(df["affinity_pred_value_raw"], errors="coerce").notna().any()
+    )
+    default_affinity_source_index = 1 if has_consensus_values else 0
+    affinity_value_source = st.radio(
+        "Affinity Value Source for Tables",
+        options=[
+            "Raw single-setting output",
+            "Consensus output (multi-sampling aggregate when available)",
+        ],
+        index=default_affinity_source_index,
+        horizontal=True,
+        help=(
+            "Controls which affinity estimate is shown in IC50/pIC50 tables. "
+            "Consensus uses the configured aggregate (for example full median) when present. "
+            "Rows without that source fall back to available values."
+        ),
+    )
+    source_mode = "consensus" if affinity_value_source.startswith("Consensus") else "raw"
+
+    display_ic50_values = []
+    display_pic50_values = []
+    display_prob_values = []
+    display_source_labels = []
+    for row in df.to_dict(orient="records"):
+        raw_pred = _to_float_local(row.get("affinity_pred_value_raw"))
+        consensus_pred = _to_float_local(row.get("affinity_pred_value_consensus"))
+        raw_prob = _to_float_local(row.get("affinity_probability_raw"))
+        consensus_prob = _to_float_local(row.get("affinity_probability_consensus"))
+        fallback_pic50 = _to_float_local(row.get("pic50"))
+        fallback_ic50 = _to_float_local(row.get("ic50_um"))
+        fallback_prob = _to_float_local(row.get("affinity_probability"))
+
+        selected_pred = None
+        selected_prob = None
+        selected_label = "fallback"
+        if source_mode == "consensus" and consensus_pred is not None:
+            selected_pred = consensus_pred
+            selected_prob = consensus_prob
+            selected_label = "consensus"
+        elif source_mode == "raw" and raw_pred is not None:
+            selected_pred = raw_pred
+            selected_prob = raw_prob
+            selected_label = "raw"
+        elif consensus_pred is not None:
+            selected_pred = consensus_pred
+            selected_prob = consensus_prob
+            selected_label = "consensus (fallback)"
+        elif raw_pred is not None:
+            selected_pred = raw_pred
+            selected_prob = raw_prob
+            selected_label = "raw (fallback)"
+
+        if selected_pred is not None:
+            row_ic50 = 10 ** float(selected_pred)
+            row_pic50 = 6.0 - float(selected_pred)
+        else:
+            row_pic50 = fallback_pic50
+            row_ic50 = fallback_ic50
+
+        if selected_prob is None:
+            selected_prob = fallback_prob
+
+        display_ic50_values.append(row_ic50)
+        display_pic50_values.append(row_pic50)
+        display_prob_values.append(selected_prob)
+        display_source_labels.append(selected_label)
+
+    df.loc[:, "ic50_um"] = display_ic50_values
+    df.loc[:, "pic50"] = display_pic50_values
+    df.loc[:, "affinity_probability"] = display_prob_values
+    df.loc[:, "affinity_value_source"] = display_source_labels
     
     # Create summary table with IC50 for each drug and protein combination
     if len(deduplicated_results) > 0:
@@ -1546,7 +3368,10 @@ def display_results_table(results: List[Dict]):
     # Reorder columns to move protein_sequence, SMILES, and status to the end (exclude workspace and design)
     column_order = [
         "protein_name", "drug_name", "ic50_um", "pic50", "affinity_probability", 
-        "confidence", "ptm", "iptm", "avg_plddt",
+        "affinity_value_source",
+        "confidence", "mutation_local_consistency_score", "mutation_local_consistency_label",
+        "mutation_local_fingerprint_similarity", "mutation_local_disruption_score",
+        "ptm", "iptm", "avg_plddt",
         "protein_sequence", "smiles", "status"
     ]
     
@@ -1572,7 +3397,33 @@ def display_results_table(results: List[Dict]):
             "ic50_um": st.column_config.NumberColumn("IC50 (μM)", format="%.4f"),
             "pic50": st.column_config.NumberColumn("pIC50", format="%.3f"),
             "affinity_probability": st.column_config.NumberColumn("Affinity Prob", format="%.3f"),
+            "affinity_value_source": st.column_config.TextColumn(
+                "Affinity Source",
+                width="medium",
+                help=(
+                    "Indicates whether displayed IC50/pIC50 came from raw single-setting output "
+                    "or consensus aggregate (for example full median)."
+                ),
+            ),
             "confidence": st.column_config.NumberColumn("Confidence", format="%.3f"),
+            "mutation_local_consistency_score": st.column_config.NumberColumn(
+                "Mut Local Consistency",
+                format="%.3f",
+                help="0-1 score comparing WT vs mutant local interaction consistency for the same drug.",
+            ),
+            "mutation_local_consistency_label": st.column_config.TextColumn(
+                "Consistency Label",
+                width="small",
+            ),
+            "mutation_local_fingerprint_similarity": st.column_config.NumberColumn(
+                "FP Similarity",
+                format="%.3f",
+            ),
+            "mutation_local_disruption_score": st.column_config.NumberColumn(
+                "Disruption",
+                format="%.3f",
+                help="Higher values indicate larger WT vs mutant interface disruption.",
+            ),
             "ptm": st.column_config.NumberColumn("pTM", format="%.3f"),
             "iptm": st.column_config.NumberColumn("ipTM", format="%.3f"),
             "avg_plddt": st.column_config.NumberColumn("Avg pLDDT", format="%.1f"),
@@ -2012,6 +3863,7 @@ def main():
     # Initialize session state for cofactor info
     if 'cofactor_info' not in st.session_state:
         st.session_state.cofactor_info = []
+    structure_only = bool(st.session_state.get("structure_only", False))
     
     # Sidebar with logo and navigation
     with st.sidebar:
@@ -2021,12 +3873,119 @@ def main():
         
         # Computation Settings
         st.subheader("Computation Mode")
-        use_gpu = st.toggle("Use GPU", value=True, help="Enable GPU acceleration for significantly faster computation. Disable if GPU is unavailable or for CPU-only processing.")
-        use_existing_results = st.toggle("Use Existing Results", value=True, help="If enabled, loads previously computed results to save time. If disabled, forces re-computation ensuring fresh results.")
+        available_gpus = discover_gpu_devices()
+        accelerator_choice = st.selectbox(
+            "Accelerator",
+            options=["GPU", "CPU"],
+            index=0,
+            help="Boltz `--accelerator` setting. Use GPU for best throughput.",
+        )
+        accelerator = accelerator_choice.lower()
+        use_gpu = accelerator == "gpu"
+        gpu_execution_mode = "single"
+        queue_worker_count = 1
+        queue_gpu_devices: List[str] = []
+
+        cuda_visible_devices: Optional[str] = None
+        if use_gpu:
+            if len(available_gpus) > 1:
+                gpu_execution_mode = st.selectbox(
+                    "GPU Execution",
+                    options=[
+                        "Single GPU",
+                        "Multi-GPU Queue (One Job per GPU)",
+                    ],
+                    index=0,
+                    help=(
+                        "Single GPU pins jobs to one selected GPU. Multi-GPU Queue runs multiple queue workers, "
+                        "assigning one job per selected GPU for higher throughput."
+                    ),
+                )
+            gpu_labels = [f"GPU {idx}: {name}" for idx, name in available_gpus]
+            if gpu_execution_mode.startswith("Multi-GPU"):
+                default_labels = gpu_labels if gpu_labels else []
+                selected_gpu_labels = st.multiselect(
+                    "GPUs for Queue Workers",
+                    options=gpu_labels,
+                    default=default_labels,
+                    help="Selected GPUs will be used by queue workers in round-robin assignment.",
+                )
+                if not selected_gpu_labels and gpu_labels:
+                    selected_gpu_labels = [gpu_labels[0]]
+                queue_gpu_devices = [
+                    label.split(":", 1)[0].replace("GPU", "").strip()
+                    for label in selected_gpu_labels
+                ]
+                queue_worker_count = max(1, len(queue_gpu_devices))
+                # Non-queue fallback path uses the first selected GPU.
+                if queue_gpu_devices:
+                    cuda_visible_devices = queue_gpu_devices[0]
+            else:
+                gpu_labels_with_auto = ["Auto (Default CUDA visibility)"] + gpu_labels
+                selected_gpu_label = st.selectbox(
+                    "GPU Device",
+                    options=gpu_labels_with_auto,
+                    index=0,
+                    help=(
+                        "Optional GPU pinning via CUDA_VISIBLE_DEVICES. "
+                        "Choose Auto to let the environment decide."
+                    ),
+                )
+                if selected_gpu_label.startswith("GPU "):
+                    cuda_visible_devices = selected_gpu_label.split(":", 1)[0].replace("GPU", "").strip()
+                    queue_gpu_devices = [cuda_visible_devices]
+                elif not available_gpus:
+                    st.caption("No local GPU list detected; Boltz will use default CUDA device visibility.")
+
+        boltz_devices = st.number_input(
+            "Boltz Devices",
+            min_value=1,
+            value=1,
+            help="Boltz `--devices` value (number of accelerator devices used by the Trainer).",
+        )
+        if gpu_execution_mode.startswith("Multi-GPU"):
+            boltz_devices = 1
+            st.caption("Multi-GPU queue mode runs one job per GPU worker; forcing `--devices=1` per job.")
+        elif use_gpu and cuda_visible_devices not in (None, "", "auto") and boltz_devices > 1:
+            st.caption("Pinned to one GPU device; forcing `--devices=1`.")
+            boltz_devices = 1
+
+        preprocessing_threads = st.number_input(
+            "Preprocessing Threads",
+            min_value=1,
+            value=max(1, min((os.cpu_count() or 1), 8)),
+            help="Boltz `--preprocessing-threads` for input/MSA preprocessing.",
+        )
+
+        result_reuse_mode = st.selectbox(
+            "Existing Results Policy",
+            options=[
+                "Reuse Valid Results (Recommended)",
+                "Recompute All Jobs",
+            ],
+            index=0,
+            help=(
+                "Reuse: skip already-computed protein-drug jobs and load saved outputs. "
+                "Recompute: ignore saved outputs and run everything again."
+            ),
+        )
+        use_existing_results = result_reuse_mode.startswith("Reuse")
+        enable_batch_execution = st.toggle(
+            "Batch New Jobs (Single Boltz Invocation)",
+            value=True,
+            help=(
+                "Run pending new jobs in one Boltz directory submission to reduce repeated process startup "
+                "and enable Boltz preprocessing parallelism. Falls back to per-job execution automatically if needed."
+            ),
+        )
         max_parallel_samples = st.number_input("Max Parallel Samples", min_value=1, value=5, help="Sets the maximum number of samples processed simultaneously. Higher values speed up computation but require more memory.")
 
         # Sampling Settings
         st.subheader("Structural Sampling")
+        recycling_steps = 4
+        sampling_steps = 300
+        diffusion_samples = 1
+        step_scale = 1.638
         recycling_steps = st.number_input("Recycling Steps", min_value=1, value=4, help="Sets the number of iterative refinement steps to improve prediction accuracy. Higher values enhance quality but increase computation time.")
         sampling_steps = st.number_input("Sampling Steps", min_value=1, value=300, help="Defines the number of steps for sampling the model's distribution. More steps improve prediction stability but require more computation.")
         diffusion_samples = st.number_input("Diffusion Samples", min_value=1, value=1, help="Specifies the number of diffusion samples generated per prediction. Increasing this improves robustness but increases runtime.")
@@ -2034,12 +3993,284 @@ def main():
 
         # Affinity Prediction Settings
         st.subheader("Affinity Prediction")
-        affinity_mw_correction = st.toggle("Molecular Weight Correction", value=False, help="If enabled, applies a molecular weight correction to affinity predictions, improving accuracy for certain molecules. Disable for standard predictions.")
-        sampling_steps_affinity = st.number_input("Sampling Steps (Affinity)", min_value=1, value=300, help="Number of sampling steps for affinity predictions. More steps enhance accuracy but extend computation time.")
-        diffusion_samples_affinity = st.number_input("Diffusion Samples (Affinity)", min_value=1, value=7, help="Number of diffusion samples for affinity predictions. Higher values improve reliability but increase runtime.")
+        affinity_mw_correction = False
+        affinity_multisampling_enabled = False
+        affinity_multisampling_profiles: List[Dict[str, int]] = []
+        affinity_multisampling_settings: List[str] = []
+        affinity_multisampling_refinement_steps: List[int] = []
+        affinity_multisampling_aggregate_mode = "median"
+        affinity_multisampling_apply_aggregate = True
+        affinity_multisampling_early_stop_enabled = True
+        affinity_multisampling_early_stop_min_points = 2
+        affinity_multisampling_early_stop_delta = 0.02
+        affinity_multisampling_early_stop_std = 0.04
+        affinity_multisampling_early_stop_patience = 1
+        affinity_multisampling_robust_outlier_filter = True
+        affinity_multisampling_robust_outlier_zmax = 3.5
+        affinity_multisampling_bootstrap_samples = 300
+        sampling_steps_affinity = 300
+        diffusion_samples_affinity = 7
+        affinity_consensus_enabled = False
+        affinity_consensus_mode = "weighted"
+        affinity_consensus_weight_floor = 0.05
+        affinity_consensus_entropy_alpha = 0.20
+        external_boltz_patch_enabled = False
+        external_boltz_patch_mode = "mutation_aware_v2"
+        external_boltz_patch_weight_floor = 0.05
+        external_boltz_patch_entropy_alpha = 0.20
+        external_boltz_patch_uncertainty_penalty = 0.15
+        external_boltz_patch_min_confidence = 0.35
+
+        if structure_only:
+            st.caption("Affinity settings are hidden in Structure-only mode.")
+        else:
+            affinity_mw_correction = st.toggle("Molecular Weight Correction", value=False, help="If enabled, applies a molecular weight correction to affinity predictions, improving accuracy for certain molecules. Disable for standard predictions.")
+            affinity_multisampling_enabled = st.toggle(
+                "Enable Affinity Multi-Sampling (Structure Once, Affinity Sweep)",
+                value=True,
+                help=(
+                    "Runs one structure prediction, then re-runs only the affinity head at multiple settings. "
+                    "This avoids repeated structure generation."
+                ),
+            )
+
+            if affinity_multisampling_enabled:
+                st.caption(
+                    "Recommended quality mode: run a sweep and use Full Consensus (Median) as the final affinity."
+                )
+                affinity_multisampling_steps_text = st.text_input(
+                    "Multi Sampling Steps (Affinity)",
+                    value="200,300,400",
+                    help=(
+                        "Comma-separated affinity sampling steps to run in order. "
+                        "Example: 200,300,400. These are the same as your paper settings by default."
+                    ),
+                )
+                affinity_multisampling_steps = _parse_positive_int_list_from_text(
+                    affinity_multisampling_steps_text
+                )
+                if not affinity_multisampling_steps:
+                    affinity_multisampling_steps = [200, 300, 400]
+                    st.caption("Using default multi-sampling steps: 200, 300, 400.")
+
+                affinity_multisampling_diffusion_text = st.text_input(
+                    "Multi Diffusion Samples (Affinity)",
+                    value="5,7,9",
+                    help=(
+                        "Comma-separated diffusion samples for each step above (same order). "
+                        "Use one value (example: 7) to apply it to all steps. "
+                        "Leave empty to auto-derive from steps."
+                    ),
+                )
+                multi_diffusion_values: List[int]
+                if not str(affinity_multisampling_diffusion_text).strip():
+                    multi_diffusion_values = [
+                        _auto_diffusion_samples_for_affinity_step(step)
+                        for step in affinity_multisampling_steps
+                    ]
+                    st.caption("Diffusion samples auto-derived from steps.")
+                else:
+                    parsed_diffusion = _parse_positive_int_list_from_text(affinity_multisampling_diffusion_text)
+                    if not parsed_diffusion:
+                        multi_diffusion_values = [
+                            _auto_diffusion_samples_for_affinity_step(step)
+                            for step in affinity_multisampling_steps
+                        ]
+                        st.caption("Invalid diffusion list; using auto-derived diffusion samples.")
+                    elif len(parsed_diffusion) == 1:
+                        multi_diffusion_values = [int(parsed_diffusion[0])] * len(affinity_multisampling_steps)
+                    else:
+                        adjusted_diffusion = [int(v) for v in parsed_diffusion]
+                        if len(adjusted_diffusion) < len(affinity_multisampling_steps):
+                            adjusted_diffusion = adjusted_diffusion + [adjusted_diffusion[-1]] * (
+                                len(affinity_multisampling_steps) - len(adjusted_diffusion)
+                            )
+                        elif len(adjusted_diffusion) > len(affinity_multisampling_steps):
+                            adjusted_diffusion = adjusted_diffusion[: len(affinity_multisampling_steps)]
+                        multi_diffusion_values = adjusted_diffusion
+
+                full_consensus_median_enabled = st.toggle(
+                    "Use Full Consensus (Median) as Final Affinity (Recommended)",
+                    value=True,
+                    help=(
+                        "If ON, the app uses the median across all executed multi-sampling affinity settings "
+                        "as the main reported affinity value. In results tables, you can switch display "
+                        "between raw and consensus values via the `Affinity Value Source` control."
+                    ),
+                )
+                if full_consensus_median_enabled:
+                    affinity_multisampling_aggregate_mode = "median"
+                    affinity_multisampling_apply_aggregate = True
+                with st.expander("Multi-Sampling Advanced Options", expanded=False):
+                    if not full_consensus_median_enabled:
+                        affinity_multisampling_aggregate_mode = st.selectbox(
+                            "How to Combine Multi-Sampling Results",
+                            options=["median", "mean", "trimmed_mean", "uncertainty_weighted"],
+                            index=0,
+                            format_func=lambda mode: {
+                                "median": "Median (Robust Default)",
+                                "mean": "Mean",
+                                "trimmed_mean": "Trimmed Mean (Drops High/Low)",
+                                "uncertainty_weighted": "Uncertainty-Weighted Mean",
+                            }.get(mode, str(mode)),
+                            help=(
+                                "Choose how per-step affinity values are merged. "
+                                "Uncertainty-weighted mean gives less weight to unstable settings."
+                            ),
+                        )
+                        affinity_multisampling_apply_aggregate = st.toggle(
+                            "Use Aggregate for Main Affinity Output",
+                            value=True,
+                            help="If ON, aggregate is used in the main affinity JSON; raw per-step values are still saved.",
+                        )
+                    affinity_multisampling_early_stop_enabled = st.toggle(
+                        "Early Stop When Sweep Converges",
+                        value=True,
+                        help=(
+                            "Stop running additional settings when aggregate affinity stops changing and "
+                            "variation stays low."
+                        ),
+                    )
+                    if affinity_multisampling_early_stop_enabled:
+                        affinity_multisampling_early_stop_min_points = int(
+                            st.number_input(
+                                "Minimum Settings Before Early Stop",
+                                min_value=2,
+                                value=2,
+                                step=1,
+                                help="Require at least this many completed settings before convergence checks begin.",
+                            )
+                        )
+                        affinity_multisampling_early_stop_delta = float(
+                            st.number_input(
+                                "Convergence Delta Threshold",
+                                min_value=0.0,
+                                value=0.02,
+                                step=0.01,
+                                format="%.3f",
+                                help="Maximum change in running aggregate to count as converged.",
+                            )
+                        )
+                        affinity_multisampling_early_stop_std = float(
+                            st.number_input(
+                                "Convergence Spread Threshold",
+                                min_value=0.0,
+                                value=0.04,
+                                step=0.01,
+                                format="%.3f",
+                                help="Maximum running standard deviation allowed for convergence.",
+                            )
+                        )
+                        affinity_multisampling_early_stop_patience = int(
+                            st.number_input(
+                                "Convergence Patience",
+                                min_value=1,
+                                value=1,
+                                step=1,
+                                help="Number of consecutive converged checks required before stopping.",
+                            )
+                        )
+                    affinity_multisampling_robust_outlier_filter = st.toggle(
+                        "Ignore Outlier Settings",
+                        value=True,
+                        help=(
+                            "Use a robust MAD-based rule to remove extreme per-setting values before aggregation."
+                        ),
+                    )
+                    if affinity_multisampling_robust_outlier_filter:
+                        affinity_multisampling_robust_outlier_zmax = float(
+                            st.number_input(
+                                "Outlier Sensitivity (MAD z-max)",
+                                min_value=1.0,
+                                value=3.5,
+                                step=0.1,
+                                format="%.1f",
+                                help="Lower values remove more outliers. Higher values keep more settings.",
+                            )
+                        )
+                    affinity_multisampling_bootstrap_samples = int(
+                        st.number_input(
+                            "Bootstrap Samples (95% CI)",
+                            min_value=0,
+                            value=300,
+                            step=50,
+                            help=(
+                                "Number of bootstrap resamples used to estimate uncertainty of the aggregate. "
+                                "Set 0 to disable CI estimation."
+                            ),
+                        )
+                    )
+
+                affinity_multisampling_profiles = [
+                    {
+                        "sampling_steps_affinity": int(step),
+                        "diffusion_samples_affinity": int(diff),
+                    }
+                    for step, diff in zip(affinity_multisampling_steps, multi_diffusion_values)
+                ]
+                affinity_multisampling_refinement_steps = [
+                    int(profile["sampling_steps_affinity"]) for profile in affinity_multisampling_profiles
+                ]
+                affinity_multisampling_settings = [
+                    f"{int(profile['sampling_steps_affinity'])}x{int(profile['diffusion_samples_affinity'])}"
+                    for profile in affinity_multisampling_profiles
+                ]
+                sampling_steps_affinity = int(affinity_multisampling_profiles[0]["sampling_steps_affinity"])
+                diffusion_samples_affinity = int(affinity_multisampling_profiles[0]["diffusion_samples_affinity"])
+                st.caption(
+                    "Multi-sampling profiles: "
+                    + ", ".join(
+                        [
+                            f"{int(p['sampling_steps_affinity'])}:{int(p['diffusion_samples_affinity'])}"
+                            for p in affinity_multisampling_profiles
+                        ]
+                    )
+                )
+            else:
+                sampling_steps_affinity = st.number_input(
+                    "Sampling Steps (Affinity)",
+                    min_value=1,
+                    value=300,
+                    help="Number of sampling steps for single-run affinity prediction.",
+                )
+                diffusion_samples_affinity = st.number_input(
+                    "Diffusion Samples (Affinity)",
+                    min_value=1,
+                    value=7,
+                    help="Number of diffusion samples for single-run affinity prediction.",
+                )
+
+            # Keep advanced affinity head-fusion and mutation-aware patch disabled in
+            # the default user-facing workflow; multi-sampling full-median is the
+            # exposed strategy for robustness.
+            affinity_consensus_enabled = False
+            external_boltz_patch_enabled = False
+
+            if not affinity_multisampling_enabled:
+                affinity_multisampling_profiles = []
+                affinity_multisampling_settings = []
+                affinity_multisampling_refinement_steps = []
+        if affinity_multisampling_enabled and enable_batch_execution:
+            st.caption(
+                "Batch mode will be bypassed when affinity multi-sampling is enabled because "
+                "multi-sampling runs per job after structure prediction."
+            )
 
         # MSA (Multiple Sequence Alignment) Settings
         st.subheader("Multiple Sequence Alignment")
+        enable_msa_cache = st.toggle(
+            "Enable MSA Cache",
+            value=True,
+            help=(
+                "Reuse previously generated WT/MSA data across mutant and multi-drug jobs. "
+                "Recommended for screening workflows because it avoids redundant MSA server calls "
+                "and significantly reduces runtime."
+            ),
+        )
+        st.caption(
+            "When enabled, BoltzOmics stores MSA from completed jobs and reuses it for related "
+            "mutants/pairs. Keep this ON for mutation-heavy screens."
+        )
         max_msa_seqs = st.number_input("Max MSA Sequences", min_value=1, value=8192, help="Sets the maximum number of Multiple Sequence Alignment (MSA) sequences used. Higher values improve prediction quality but increase memory usage.")
         subsample_msa = st.toggle("Subsample MSA", value=False, help="If enabled, subsamples the MSA to reduce memory usage and potentially increase prediction diversity, at the cost of slightly reduced accuracy.")
         num_subsampled_msa = 1024
@@ -2214,11 +4445,10 @@ def main():
         with col_struct_only:
             structure_only = st.toggle(
                 "Structural prediction only (no ligand)",
-                value=st.session_state.get('structure_only', False),
+                key="structure_only",
                 help="If enabled, skip ligand input and affinity prediction. Only protein structure will be predicted."
             )
-        # Store in session state for downstream use
-        st.session_state["structure_only"] = structure_only
+        mutation_chain_starts: Dict[str, int] = {}
         
         if input_mode == "Multi-Protein Mode":
             # Multi-Protein mode - existing FASTA format
@@ -2286,6 +4516,7 @@ def main():
                                 help=f"Enter the residue number for the first residue in chain {chain_id}"
                             )
                             chain_starts[chain_id] = start_number
+                        mutation_chain_starts = dict(chain_starts)
                     else:
                         # Single chain
                         start_number = st.number_input(
@@ -2296,6 +4527,7 @@ def main():
                             help="Enter the residue number for the first residue"
                         )
                         chain_starts['A'] = start_number
+                        mutation_chain_starts = dict(chain_starts)
                 
                 # Mutations section
                 mutations_input = st.text_area(
@@ -2462,6 +4694,7 @@ def main():
                             chain_starts['A'] = st.session_state["chain_start_single"]
                         else:
                             chain_starts['A'] = 1  # Default
+                    mutation_chain_starts = dict(chain_starts)
                     
                     # Parse mutations
                     mutation_lists = parse_mutations(mutations_input)
@@ -2495,6 +4728,14 @@ def main():
     # Advanced options tabs container
     with st.container(border=True):
         st.subheader(":material/tune: Advanced Options")
+        mutation_steering_enabled = False
+        mutation_steering_window = 3
+        mutation_steering_max_distance = 6.0
+        mutation_steering_apply_to_wt = False
+        mutation_steering_enable_potentials = True
+        method_prior_label = "None"
+        method_prior_value: Optional[str] = None
+        compute_mutation_local_consistency = False
 
         tab_mutation, tab1, tab2, tab3, tab4, tab5 = st.tabs([
             ":material/biotech: Mutation Discovery",
@@ -2508,6 +4749,76 @@ def main():
         # Tab 0: Mutation Discovery
         with tab_mutation:
             display_mutation_discovery_section()
+            with st.expander("Mutation-Conditioned Pocket Steering", expanded=False):
+                st.caption(
+                    "Adds mutation-neighborhood pocket contacts automatically using your residue numbering "
+                    "and chain start values, then optionally enables Boltz inference potentials."
+                )
+                mutation_steering_enabled = st.toggle(
+                    "Enable Mutation Steering",
+                    value=False,
+                    disabled=structure_only or input_mode != "Mutation Mode",
+                    help=(
+                        "For each mutant, automatically build pocket contacts around mutated residues. "
+                        "This helps keep ligand placement consistent near mutation sites."
+                    ),
+                )
+                mutation_steering_window = st.slider(
+                    "Neighborhood Window (± residues)",
+                    min_value=0,
+                    max_value=12,
+                    value=3,
+                    disabled=not mutation_steering_enabled,
+                    help="How many residues around each mutation to include as pocket contacts.",
+                )
+                mutation_steering_max_distance = st.number_input(
+                    "Steering Max Distance (Å)",
+                    min_value=4.0,
+                    max_value=20.0,
+                    value=6.0,
+                    step=0.5,
+                    disabled=not mutation_steering_enabled,
+                    help="Distance used for automatically generated steering contacts.",
+                )
+                mutation_steering_apply_to_wt = st.toggle(
+                    "Apply Steering to WT",
+                    value=False,
+                    disabled=not mutation_steering_enabled,
+                    help="If OFF, steering is applied to mutant proteins only.",
+                )
+                mutation_steering_enable_potentials = st.toggle(
+                    "Enable Boltz Potentials (`--use_potentials`)",
+                    value=True,
+                    disabled=not mutation_steering_enabled,
+                    help=(
+                        "Boltz inference potentials add soft geometric guidance from constraints "
+                        "(such as pocket contacts) during sampling."
+                    ),
+                )
+                method_prior_label = st.selectbox(
+                    "Method Prior (`--method`, optional)",
+                    options=["None", "electron microscopy", "x-ray diffraction", "other"],
+                    index=0,
+                    disabled=not mutation_steering_enabled,
+                    help=(
+                        "Optional Boltz structural-method prior. Leave as None unless you are testing "
+                        "target-specific ablations."
+                    ),
+                )
+                method_prior_value = None if method_prior_label == "None" else method_prior_label
+                if structure_only:
+                    st.info("Mutation steering is disabled in structure-only mode.")
+                elif input_mode != "Mutation Mode":
+                    st.info("Switch to Mutation Mode to enable mutation-conditioned steering.")
+                compute_mutation_local_consistency = st.toggle(
+                    "Compute Mutation-Local Consistency Score",
+                    value=False,
+                    disabled=structure_only or input_mode != "Mutation Mode",
+                    help=(
+                        "Compares each mutant pose against WT (same drug) using interaction fingerprints "
+                        "and disruption metrics, then reports a 0-1 local consistency score."
+                    ),
+                )
 
         # Tab 1: Co-factors
         with tab1:
@@ -2705,6 +5016,19 @@ def main():
             # Store protein-drug filter in session state
             if protein_drug_filter:
                 st.session_state.protein_drug_filter = protein_drug_filter
+
+    mutation_steering_config = {
+        "enabled": bool(mutation_steering_enabled),
+        "window": int(mutation_steering_window),
+        "max_distance": float(mutation_steering_max_distance),
+        "apply_to_wt": bool(mutation_steering_apply_to_wt),
+        "mutation_mode_active": input_mode == "Mutation Mode",
+        "chain_starts": dict(mutation_chain_starts),
+    }
+    st.session_state["mutation_steering_config"] = mutation_steering_config
+    st.session_state["compute_mutation_local_consistency"] = bool(compute_mutation_local_consistency)
+    use_potentials = bool(mutation_steering_enabled and mutation_steering_enable_potentials)
+    method = method_prior_value if mutation_steering_enabled else None
     
     # Display parsed data
     if protein_sequences or drug_smiles:
@@ -3098,7 +5422,35 @@ def main():
                     st.write(f"**:material/donut_large: Binding pocket [<chain><resid>]:**")
                     st.write(f"- {example_residues}")
                 st.write(f" - Max distance: {max_distance} Å")
-            
+
+            steering_cfg = st.session_state.get("mutation_steering_config", {})
+            if steering_cfg.get("enabled"):
+                st.write("**:material/biotech: Mutation-conditioned steering:**")
+                st.write(f"- Window: ±{int(steering_cfg.get('window', 3))} residues around each mutation")
+                st.write(f"- Auto-generated max distance: {float(steering_cfg.get('max_distance', 6.0)):.1f} Å")
+                st.write(f"- Apply to WT: {'Yes' if steering_cfg.get('apply_to_wt') else 'No'}")
+                st.write(f"- Boltz potentials (`--use_potentials`): {'Enabled' if use_potentials else 'Disabled'}")
+                if method:
+                    st.write(f"- Method prior (`--method`): {method}")
+            st.write("**:material/sync_alt: Affinity strategy:**")
+            st.write("- User-facing mode: multi-sampling sweep + consensus aggregation")
+            st.write("- Advanced head-consensus and mutation-aware conformer patch: disabled")
+            if not structure_only:
+                st.write(f"- Affinity multi-sampling: {'Enabled' if affinity_multisampling_enabled else 'Disabled'}")
+                if affinity_multisampling_enabled:
+                    profile_text = ", ".join(
+                        f"{int(p['sampling_steps_affinity'])}:{int(p['diffusion_samples_affinity'])}"
+                        for p in (affinity_multisampling_profiles or [])
+                    )
+                    st.write(
+                        f"- Multi-sampling profiles (steps:diffusion): "
+                        f"{profile_text or f'{int(sampling_steps_affinity)}:{int(diffusion_samples_affinity)}'}"
+                    )
+                    st.write(f"- Aggregate mode: {affinity_multisampling_aggregate_mode}")
+                    st.write(f"- Apply aggregate: {'Yes' if affinity_multisampling_apply_aggregate else 'No'}")
+                    st.write(f"- Early stop: {'On' if affinity_multisampling_early_stop_enabled else 'Off'}")
+                    st.write(f"- Outlier filter: {'On' if affinity_multisampling_robust_outlier_filter else 'Off'}")
+
             # Display PTM modifications if provided
             ptm_modifications = st.session_state.get('ptm_modifications')
             if ptm_modifications and ptm_modifications.get('modifications'):
@@ -3152,9 +5504,14 @@ def main():
                     else:
                         st.error("No valid protein-drug combinations found.")
                 elif queue_mode_active:
-                    ensure_job_manager_executor()
+                    ensure_job_manager_executor(worker_count=queue_worker_count)
                     shared_params = {
                         "use_gpu": use_gpu,
+                        "accelerator": accelerator,
+                        "devices": boltz_devices,
+                        "cuda_visible_devices": cuda_visible_devices,
+                        "queue_gpu_devices": queue_gpu_devices if gpu_execution_mode.startswith("Multi-GPU") else None,
+                        "preprocessing_threads": preprocessing_threads,
                         "override": not use_existing_results,
                         "recycling_steps": recycling_steps,
                         "sampling_steps": sampling_steps,
@@ -3162,6 +5519,32 @@ def main():
                         "max_parallel_samples": max_parallel_samples,
                         "step_scale": step_scale,
                         "affinity_mw_correction": affinity_mw_correction,
+                        "affinity_consensus_enabled": affinity_consensus_enabled,
+                        "affinity_consensus_mode": affinity_consensus_mode,
+                        "affinity_consensus_weight_floor": affinity_consensus_weight_floor,
+                        "affinity_consensus_entropy_alpha": affinity_consensus_entropy_alpha,
+                        "external_boltz_patch_enabled": external_boltz_patch_enabled,
+                        "external_boltz_patch_mode": external_boltz_patch_mode,
+                        "external_boltz_patch_weight_floor": external_boltz_patch_weight_floor,
+                        "external_boltz_patch_entropy_alpha": external_boltz_patch_entropy_alpha,
+                        "external_boltz_patch_uncertainty_penalty": external_boltz_patch_uncertainty_penalty,
+                        "external_boltz_patch_min_confidence": external_boltz_patch_min_confidence,
+                        "affinity_multisampling_enabled": affinity_multisampling_enabled,
+                        "affinity_multisampling_profiles": affinity_multisampling_profiles,
+                        "affinity_multisampling_settings": affinity_multisampling_settings,
+                        "affinity_multisampling_refinement_steps": affinity_multisampling_refinement_steps,
+                        "affinity_multisampling_aggregate_mode": affinity_multisampling_aggregate_mode,
+                        "affinity_multisampling_apply_aggregate": affinity_multisampling_apply_aggregate,
+                        "affinity_multisampling_early_stop_enabled": affinity_multisampling_early_stop_enabled,
+                        "affinity_multisampling_early_stop_min_points": affinity_multisampling_early_stop_min_points,
+                        "affinity_multisampling_early_stop_delta": affinity_multisampling_early_stop_delta,
+                        "affinity_multisampling_early_stop_std": affinity_multisampling_early_stop_std,
+                        "affinity_multisampling_early_stop_patience": affinity_multisampling_early_stop_patience,
+                        "affinity_multisampling_robust_outlier_filter": affinity_multisampling_robust_outlier_filter,
+                        "affinity_multisampling_robust_outlier_zmax": affinity_multisampling_robust_outlier_zmax,
+                        "affinity_multisampling_bootstrap_samples": affinity_multisampling_bootstrap_samples,
+                        "use_potentials": use_potentials,
+                        "method": method,
                         "max_msa_seqs": max_msa_seqs,
                         "sampling_steps_affinity": sampling_steps_affinity,
                         "diffusion_samples_affinity": diffusion_samples_affinity,
@@ -3172,9 +5555,11 @@ def main():
                         "num_subsampled_msa": num_subsampled_msa,
                         "template_cif_path": template_cif_path,
                         "binding_pocket_constraints": binding_pocket_constraints,
+                        "mutation_steering_config": mutation_steering_config,
                         "cofactor_info": cofactor_info,
                         "ptm_modifications": ptm_modifications,
                         "prediction_timeout_seconds": prediction_timeout_minutes * 60,
+                        "enable_msa_cache": enable_msa_cache,
                     }
                     jobs, cached_results, job_summary = prepare_screening_jobs(
                         protein_sequences=protein_sequences,
@@ -3216,6 +5601,10 @@ def main():
                             drug_smiles=drug_smiles,
                             project_name=project_name,
                             use_gpu=use_gpu,
+                            accelerator=accelerator,
+                            devices=boltz_devices,
+                            cuda_visible_devices=cuda_visible_devices,
+                            preprocessing_threads=preprocessing_threads,
                             use_existing_results=use_existing_results,
                             recycling_steps=recycling_steps,
                             sampling_steps=sampling_steps,
@@ -3223,11 +5612,38 @@ def main():
                             max_parallel_samples=max_parallel_samples,
                             step_scale=step_scale,
                             affinity_mw_correction=affinity_mw_correction,
+                            affinity_consensus_enabled=affinity_consensus_enabled,
+                            affinity_consensus_mode=affinity_consensus_mode,
+                            affinity_consensus_weight_floor=affinity_consensus_weight_floor,
+                            affinity_consensus_entropy_alpha=affinity_consensus_entropy_alpha,
+                            external_boltz_patch_enabled=external_boltz_patch_enabled,
+                            external_boltz_patch_mode=external_boltz_patch_mode,
+                            external_boltz_patch_weight_floor=external_boltz_patch_weight_floor,
+                            external_boltz_patch_entropy_alpha=external_boltz_patch_entropy_alpha,
+                            external_boltz_patch_uncertainty_penalty=external_boltz_patch_uncertainty_penalty,
+                            external_boltz_patch_min_confidence=external_boltz_patch_min_confidence,
+                            affinity_multisampling_enabled=affinity_multisampling_enabled,
+                            affinity_multisampling_profiles=affinity_multisampling_profiles,
+                            affinity_multisampling_settings=affinity_multisampling_settings,
+                            affinity_multisampling_refinement_steps=affinity_multisampling_refinement_steps,
+                            affinity_multisampling_aggregate_mode=affinity_multisampling_aggregate_mode,
+                            affinity_multisampling_apply_aggregate=affinity_multisampling_apply_aggregate,
+                            affinity_multisampling_early_stop_enabled=affinity_multisampling_early_stop_enabled,
+                            affinity_multisampling_early_stop_min_points=affinity_multisampling_early_stop_min_points,
+                            affinity_multisampling_early_stop_delta=affinity_multisampling_early_stop_delta,
+                            affinity_multisampling_early_stop_std=affinity_multisampling_early_stop_std,
+                            affinity_multisampling_early_stop_patience=affinity_multisampling_early_stop_patience,
+                            affinity_multisampling_robust_outlier_filter=affinity_multisampling_robust_outlier_filter,
+                            affinity_multisampling_robust_outlier_zmax=affinity_multisampling_robust_outlier_zmax,
+                            affinity_multisampling_bootstrap_samples=affinity_multisampling_bootstrap_samples,
+                            use_potentials=use_potentials,
+                            method=method,
                             max_msa_seqs=max_msa_seqs,
                             sampling_steps_affinity=sampling_steps_affinity,
                             diffusion_samples_affinity=diffusion_samples_affinity,
                             cofactor_info=cofactor_info,
                             binding_pocket_constraints=binding_pocket_constraints,
+                            mutation_steering_config=mutation_steering_config,
                             enable_retries=enable_retries,
                             max_retry_attempts=max_retry_attempts,
                             retry_delay_base=retry_delay_base,
@@ -3237,6 +5653,8 @@ def main():
                             structure_only=structure_only,
                             ptm_modifications=ptm_modifications,
                             prediction_timeout_seconds=prediction_timeout_minutes * 60,
+                            enable_msa_cache=enable_msa_cache,
+                            enable_batch_execution=(enable_batch_execution and not affinity_multisampling_enabled),
                         )
                     if results:
                         current_results = st.session_state.get('screening_results', [])
@@ -3284,6 +5702,32 @@ def main():
         synchronize_job_results(project_name)
         queue_summary = render_job_queue_status(project_name)
         maybe_schedule_queue_autorefresh(queue_summary)
+
+    # Optional post-processing: mutation-local consistency annotation.
+    active_project_name = project_name or st.session_state.get("loaded_project_name")
+    if (
+        annotate_results_with_mutation_local_consistency is not None
+        and not structure_only
+        and active_project_name
+        and hasattr(st.session_state, "screening_results")
+        and st.session_state.screening_results
+        and st.session_state.get("compute_mutation_local_consistency", False)
+    ):
+        cache = st.session_state.get("_mutation_local_consistency_cache", {})
+        annotated_results, cache, consistency_summary = annotate_results_with_mutation_local_consistency(
+            results=st.session_state.screening_results,
+            project_name=active_project_name,
+            enabled=True,
+            cache=cache,
+        )
+        st.session_state._mutation_local_consistency_cache = cache
+        st.session_state.screening_results = annotated_results
+        if consistency_summary.get("annotated", 0) > 0:
+            st.caption(
+                "Mutation-local consistency annotated: "
+                f"{consistency_summary['annotated']} entries "
+                f"(errors: {consistency_summary.get('errors', 0)})."
+            )
 
     # Display screening processing summary outside of columns
     if hasattr(st.session_state, 'screening_results') and st.session_state.screening_results:
