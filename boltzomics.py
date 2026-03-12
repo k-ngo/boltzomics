@@ -1095,6 +1095,9 @@ def run_boltz_with_retry(
     cache_fallback_triggered = False
     force_override_rebuild = False
     force_clean_rebuild = False
+    oom_fallback_applied = False
+    current_max_parallel_samples = int(max_parallel_samples)
+    current_devices = int(devices)
     patch_mutation_positions = (
         _extract_mutation_positions_from_label(protein_display_name)
         if external_boltz_patch_enabled
@@ -1165,7 +1168,7 @@ def run_boltz_with_retry(
                     recycling_steps=recycling_steps,
                     sampling_steps=sampling_steps,
                     diffusion_samples=diffusion_samples,
-                    max_parallel_samples=max_parallel_samples,
+                    max_parallel_samples=current_max_parallel_samples,
                     step_scale=step_scale,
                     affinity_mw_correction=affinity_mw_correction,
                     external_boltz_patch_enabled=external_boltz_patch_enabled,
@@ -1183,7 +1186,7 @@ def run_boltz_with_retry(
                     timeout=prediction_timeout_seconds,
                     use_cached_msa=current_use_cached_msa,  # Skip MSA server when using cache
                     accelerator=accelerator,
-                    devices=devices,
+                    devices=current_devices,
                     cuda_visible_devices=cuda_visible_devices,
                     preprocessing_threads=preprocessing_threads,
                     use_potentials=use_potentials,
@@ -1226,7 +1229,7 @@ def run_boltz_with_retry(
                             recycling_steps=recycling_steps,
                             sampling_steps=sampling_steps,
                             diffusion_samples=diffusion_samples,
-                            max_parallel_samples=max_parallel_samples,
+                            max_parallel_samples=current_max_parallel_samples,
                             step_scale=step_scale,
                             affinity_mw_correction=affinity_mw_correction,
                             external_boltz_patch_enabled=external_boltz_patch_enabled,
@@ -1244,7 +1247,7 @@ def run_boltz_with_retry(
                             timeout=prediction_timeout_seconds,
                             use_cached_msa=current_use_cached_msa,
                             accelerator=accelerator,
-                            devices=devices,
+                            devices=current_devices,
                             cuda_visible_devices=cuda_visible_devices,
                             preprocessing_threads=preprocessing_threads,
                             use_potentials=use_potentials,
@@ -1266,11 +1269,11 @@ def run_boltz_with_retry(
                     multi_result = run_affinity_multisampling(
                         yaml_filepath=yaml_filepath,
                         use_gpu=use_gpu,
-                        override=False,  # keep structure cached; only refresh affinity output
+                        override=False,  # preserve prior behavior: reuse existing structure outputs
                         recycling_steps=recycling_steps,
                         sampling_steps=sampling_steps,
                         diffusion_samples=diffusion_samples,
-                        max_parallel_samples=max_parallel_samples,
+                        max_parallel_samples=current_max_parallel_samples,
                         step_scale=step_scale,
                         affinity_mw_correction=affinity_mw_correction,
                         max_msa_seqs=max_msa_seqs,
@@ -1279,7 +1282,7 @@ def run_boltz_with_retry(
                         timeout=prediction_timeout_seconds,
                         use_cached_msa=current_use_cached_msa,
                         accelerator=accelerator,
-                        devices=devices,
+                        devices=current_devices,
                         cuda_visible_devices=cuda_visible_devices,
                         preprocessing_threads=preprocessing_threads,
                         use_potentials=use_potentials,
@@ -1349,10 +1352,42 @@ def run_boltz_with_retry(
             return results, True, None
         except Exception as e:
             last_error = str(e)
-            missing_pre_affinity_cache = (
-                "pre_affinity_" in last_error.lower()
-                and "not found" in last_error.lower()
+            last_error_lower = last_error.lower()
+            oom_failure = (
+                ("out of memory" in last_error_lower)
+                or ("ran out of memory" in last_error_lower)
+                or ("number of failed examples" in last_error_lower)
             )
+            missing_pre_affinity_cache = (
+                "pre_affinity_" in last_error_lower
+                and "not found" in last_error_lower
+            )
+            if (
+                oom_failure
+                and attempt < max_retry_attempts
+                and not oom_fallback_applied
+            ):
+                oom_fallback_applied = True
+                force_override_rebuild = True
+                force_clean_rebuild = True
+                current_max_parallel_samples = 1
+                if str(accelerator).lower() == "gpu":
+                    current_devices = 1
+                notify(
+                    "oom_fallback_retry",
+                    {
+                        "attempt": attempt + 1,
+                        "protein": protein_display_name,
+                        "ligand": ligand_display_name,
+                        "error": last_error[:200],
+                    },
+                )
+                if emit_streamlit_feedback:
+                    st.warning(
+                        "Boltz reported GPU memory pressure. Retrying with safer memory settings "
+                        "(max_parallel_samples=1, devices=1)."
+                    )
+                continue
             if (
                 (not structure_only)
                 and missing_pre_affinity_cache
@@ -1935,12 +1970,6 @@ def execute_screening_job(job: ScreeningJob, worker_id: int = 0) -> Tuple[Dict[s
         params["cuda_visible_devices"] = effective_cuda_visible_devices
         params["devices"] = 1
 
-    canonical_project_dir = os.path.join(RESULTS_DIR, job.project_name)
-    isolated_root = os.path.join(canonical_project_dir, "_queue_worker_runs")
-    safe_job_id = str(job.job_id).replace(":", "_").replace("/", "_").replace("\\", "_")
-    isolated_run_dir = os.path.join(isolated_root, f"worker_{int(worker_id)}", safe_job_id)
-    os.makedirs(isolated_run_dir, exist_ok=True)
-
     boltz_results, success, error_message = run_boltz_with_retry(
         workspace_name=job.workspace_name,
         design_name=job.design_name,
@@ -2002,32 +2031,9 @@ def execute_screening_job(job: ScreeningJob, worker_id: int = 0) -> Tuple[Dict[s
         msa_path=msa_path,
         use_cached_msa=use_cached_msa,
         enable_msa_cache=enable_msa_cache,
-        execution_directory=isolated_run_dir,
     )
     if not success or boltz_results is None:
         raise RuntimeError(error_message or "Boltz prediction failed")
-
-    yaml_filename = f"{job.workspace_name}_{job.design_name}.yaml"
-    yaml_name = os.path.splitext(yaml_filename)[0]
-    isolated_yaml_path = os.path.join(isolated_run_dir, yaml_filename)
-    isolated_boltz_dir = os.path.join(isolated_run_dir, f"boltz_results_{yaml_name}")
-    canonical_yaml_path = os.path.join(canonical_project_dir, yaml_filename)
-    canonical_boltz_dir = os.path.join(canonical_project_dir, f"boltz_results_{yaml_name}")
-    publish_lock = os.path.join(canonical_project_dir, f".publish_{yaml_name}.lock")
-
-    os.makedirs(canonical_project_dir, exist_ok=True)
-    with _boltz_job_file_lock(publish_lock):
-        if os.path.exists(canonical_yaml_path):
-            try:
-                os.remove(canonical_yaml_path)
-            except Exception:
-                pass
-        if os.path.exists(canonical_boltz_dir):
-            shutil.rmtree(canonical_boltz_dir, ignore_errors=True)
-        if os.path.exists(isolated_yaml_path):
-            shutil.move(isolated_yaml_path, canonical_yaml_path)
-        if os.path.exists(isolated_boltz_dir):
-            shutil.move(isolated_boltz_dir, canonical_boltz_dir)
 
     result_entry = _create_result_entry(
         protein_name=job.protein_name,

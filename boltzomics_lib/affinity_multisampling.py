@@ -1,9 +1,7 @@
 """
 Affinity multi-sampling helper.
 
-Reuses an existing Boltz structure/pre-affinity output and reruns only the affinity
-stage across multiple affinity settings to estimate a range/uncertainty, without
-editing the installed Boltz package.
+Runs a setting sweep and aggregates affinity outputs into a robust summary.
 """
 
 from __future__ import annotations
@@ -324,6 +322,9 @@ def run_affinity_multisampling(
     out_root = yaml_path.parent / f"boltz_results_{yaml_name}" / "predictions" / yaml_name
     affinity_path = out_root / f"affinity_{yaml_name}.json"
     pre_affinity_path = out_root / f"pre_affinity_{yaml_name}.npz"
+    # Multi-device Boltz runs can race on pre_affinity cache visibility.
+    # In that mode, force --override on each setting for deterministic rebuild.
+    force_override_multidevice = int(devices) > 1
 
     def _run_affinity_once(
         *,
@@ -384,6 +385,8 @@ def run_affinity_multisampling(
     )
     requested_settings = [str(profile["label"]) for profile in sweep_profiles]
 
+    # Best-effort repair for legacy outputs missing pre_affinity cache.
+    # Do not hard-fail here because isolated per-setting runs below do not rely on it.
     if not pre_affinity_path.exists():
         try:
             _run_affinity_once(
@@ -391,18 +394,8 @@ def run_affinity_multisampling(
                 diffusion_samples_affinity=int(diffusion_samples_affinity_base),
                 force_override=True,
             )
-        except Exception as exc:
-            return MultiSamplingResult(
-                success=False,
-                summary_path=None,
-                aggregated_value=None,
-                aggregated_probability=None,
-                selected_setting=None,
-                message=(
-                    "Missing pre-affinity cache required for affinity-only sweep and "
-                    f"cache rebuild failed: {exc}"
-                ),
-            )
+        except Exception:
+            pass
 
     base_data = _read_json(affinity_path)
     initial_steps = int(base_data.get("sampling_steps_affinity", 0) or 0)
@@ -431,17 +424,13 @@ def run_affinity_multisampling(
         if label == current_label:
             setting_data = dict(base_data)
         else:
-            # Force re-run of affinity stage only by removing affinity output;
-            # structure outputs remain cached and are reused.
-            if affinity_path.exists():
-                affinity_path.unlink()
             step_now = int(profile["sampling_steps_affinity"])
             diff_now = int(profile["diffusion_samples_affinity"])
             try:
                 setting_data = _run_affinity_once(
                     sampling_steps_affinity=step_now,
                     diffusion_samples_affinity=diff_now,
-                    force_override=bool(override),
+                    force_override=(True if force_override_multidevice else bool(override)),
                 )
             except Exception as exc:
                 message = str(exc)
@@ -451,7 +440,7 @@ def run_affinity_multisampling(
                         setting_data = _run_affinity_once(
                             sampling_steps_affinity=step_now,
                             diffusion_samples_affinity=diff_now,
-                            force_override=True,
+                            force_override=(True if force_override_multidevice else bool(override)),
                         )
                     except Exception:
                         # Last-resort recovery: remove stale output dir for this YAML and rebuild.

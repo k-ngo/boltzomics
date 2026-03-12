@@ -490,6 +490,7 @@ def run_boltz_prediction(
     devices=1,
     cuda_visible_devices=None,
     preprocessing_threads=1,
+    num_workers=0,
     use_potentials=False,
     method=None,
     external_boltz_patch_enabled=False,
@@ -535,7 +536,8 @@ def run_boltz_prediction(
             used by mutation-local external patch selector.
     """
     try:
-        # Change to the directory containing the YAML file
+        # Normalize to absolute paths to avoid cwd-dependent failures in multi-process runs.
+        yaml_filepath = os.path.abspath(str(yaml_filepath))
         yaml_dir = os.path.dirname(yaml_filepath)
         yaml_filename = os.path.basename(yaml_filepath)
         # Resolve accelerator mode.
@@ -548,14 +550,15 @@ def run_boltz_prediction(
         # so we don't need --use_msa_server
         if external_boltz_patch_enabled:
             patch_cli = Path(__file__).resolve().parent / "boltz2_patched_cli.py"
-            cmd = ["python", str(patch_cli), "predict", yaml_filename, "--output_format", "pdb"]
+            cmd = ["python", str(patch_cli), "predict", yaml_filepath, "--output_format", "pdb"]
         else:
-            cmd = ["boltz", "predict", yaml_filename, "--output_format", "pdb"]
+            cmd = ["boltz", "predict", yaml_filepath, "--output_format", "pdb"]
         if not use_cached_msa:
             cmd.append("--use_msa_server")
         cmd.extend(["--accelerator", selected_accelerator])
         cmd.extend(["--devices", str(int(devices))])
         cmd.extend(["--preprocessing-threads", str(int(preprocessing_threads))])
+        cmd.extend(["--num_workers", str(int(num_workers))])
         # Add override flag if specified
         if override:
             cmd.append("--override")
@@ -581,6 +584,7 @@ def run_boltz_prediction(
         # Print the command line for user reference
         print("[DEBUG]", " ".join(cmd))
         env = os.environ.copy()
+        env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
         if selected_accelerator == "gpu" and cuda_visible_devices not in (None, "", "auto"):
             env["CUDA_VISIBLE_DEVICES"] = str(cuda_visible_devices)
         if external_boltz_patch_enabled:
@@ -631,6 +635,7 @@ def run_boltz_batch_prediction(
     devices=1,
     cuda_visible_devices=None,
     preprocessing_threads=1,
+    num_workers=0,
     override=False,
     recycling_steps=3,
     sampling_steps=200,
@@ -666,6 +671,7 @@ def run_boltz_batch_prediction(
         cmd.extend(["--accelerator", str(accelerator).lower()])
         cmd.extend(["--devices", str(int(devices))])
         cmd.extend(["--preprocessing-threads", str(int(preprocessing_threads))])
+        cmd.extend(["--num_workers", str(int(num_workers))])
 
         if override:
             cmd.append("--override")
@@ -689,6 +695,7 @@ def run_boltz_batch_prediction(
             cmd.extend(["--num_subsampled_msa", str(int(num_subsampled_msa))])
 
         env = os.environ.copy()
+        env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
         if str(accelerator).lower() == "gpu" and cuda_visible_devices not in (None, "", "auto"):
             env["CUDA_VISIBLE_DEVICES"] = str(cuda_visible_devices)
         if external_boltz_patch_enabled:
