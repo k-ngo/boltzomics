@@ -447,11 +447,23 @@ def run_affinity_multisampling(
                 message = str(exc)
                 # Recovery path for legacy/incomplete caches missing pre_affinity_*.npz.
                 if ("pre_affinity_" in message) or ("FileNotFoundError" in message):
-                    setting_data = _run_affinity_once(
-                        sampling_steps_affinity=step_now,
-                        diffusion_samples_affinity=diff_now,
-                        force_override=True,
-                    )
+                    try:
+                        setting_data = _run_affinity_once(
+                            sampling_steps_affinity=step_now,
+                            diffusion_samples_affinity=diff_now,
+                            force_override=True,
+                        )
+                    except Exception:
+                        # Last-resort recovery: remove stale output dir for this YAML and rebuild.
+                        output_dir = yaml_path.parent / f"boltz_results_{yaml_name}"
+                        if output_dir.exists():
+                            import shutil
+                            shutil.rmtree(output_dir, ignore_errors=True)
+                        setting_data = _run_affinity_once(
+                            sampling_steps_affinity=step_now,
+                            diffusion_samples_affinity=diff_now,
+                            force_override=True,
+                        )
                 else:
                     raise
 

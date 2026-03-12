@@ -22,6 +22,7 @@ from collections import OrderedDict
 import uuid
 import subprocess
 import sys
+from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
@@ -668,6 +669,43 @@ def _extract_mutation_positions_from_name(protein_name: str) -> List[int]:
     return sorted(set(positions))
 
 
+@contextmanager
+def _boltz_job_file_lock(
+    lock_path: str,
+    timeout_seconds: float = 900.0,
+    stale_seconds: float = 21600.0,
+):
+    """
+    Simple cross-process lock using atomic lock-file creation.
+    Prevents two workers/sessions from writing the same boltz_results_<yaml> path.
+    """
+    start = time.time()
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(f"pid={os.getpid()} started={time.time():.3f}\n")
+            break
+        except FileExistsError:
+            try:
+                mtime = os.path.getmtime(lock_path)
+                if (time.time() - mtime) > float(stale_seconds):
+                    os.remove(lock_path)
+                    continue
+            except FileNotFoundError:
+                continue
+            if (time.time() - start) >= float(timeout_seconds):
+                raise TimeoutError(f"Timed out waiting for job lock: {lock_path}")
+            time.sleep(0.5)
+    try:
+        yield
+    finally:
+        try:
+            os.remove(lock_path)
+        except FileNotFoundError:
+            pass
+
+
 def _resolve_mutation_steering_constraints(
     protein_name: str,
     protein_sequence: str,
@@ -1038,6 +1076,7 @@ def run_boltz_with_retry(
     msa_path: Optional[str] = None,
     use_cached_msa: bool = False,
     enable_msa_cache: bool = True,
+    execution_directory: Optional[str] = None,
 ):
     """Run Boltz workflow with retry logic and validation.
 
@@ -1055,6 +1094,7 @@ def run_boltz_with_retry(
     current_use_cached_msa = bool(use_cached_msa)
     cache_fallback_triggered = False
     force_override_rebuild = False
+    force_clean_rebuild = False
     patch_mutation_positions = (
         _extract_mutation_positions_from_label(protein_display_name)
         if external_boltz_patch_enabled
@@ -1082,9 +1122,12 @@ def run_boltz_with_retry(
                 structure_only,
                 ptm_modifications,
                 msa_path=current_msa_path,  # MSA caching support
+                target_directory=execution_directory,
             )
             yaml_dir = os.path.dirname(yaml_filepath)
             yaml_name = os.path.splitext(os.path.basename(yaml_filepath))[0]
+            boltz_output_dir = os.path.join(yaml_dir, f"boltz_results_{yaml_name}")
+            lock_path = os.path.join(yaml_dir, f".{yaml_name}.boltz.lock")
             pre_affinity_path = os.path.join(
                 yaml_dir,
                 f"boltz_results_{yaml_name}",
@@ -1092,6 +1135,12 @@ def run_boltz_with_retry(
                 yaml_name,
                 f"pre_affinity_{yaml_name}.npz",
             )
+            if force_clean_rebuild and os.path.exists(boltz_output_dir):
+                try:
+                    shutil.rmtree(boltz_output_dir)
+                except Exception:
+                    pass
+                force_clean_rebuild = False
             if (
                 (not structure_only)
                 and (not override)
@@ -1108,37 +1157,38 @@ def run_boltz_with_retry(
                         "ligand": ligand_display_name,
                     },
                 )
-            utils.run_boltz_prediction(
-                yaml_filepath=yaml_filepath,
-                use_gpu=use_gpu,
-                override=(override or force_override_rebuild),
-                recycling_steps=recycling_steps,
-                sampling_steps=sampling_steps,
-                diffusion_samples=diffusion_samples,
-                max_parallel_samples=max_parallel_samples,
-                step_scale=step_scale,
-                affinity_mw_correction=affinity_mw_correction,
-                external_boltz_patch_enabled=external_boltz_patch_enabled,
-                external_boltz_patch_mode=external_boltz_patch_mode,
-                external_boltz_patch_weight_floor=external_boltz_patch_weight_floor,
-                external_boltz_patch_entropy_alpha=external_boltz_patch_entropy_alpha,
-                external_boltz_patch_uncertainty_penalty=external_boltz_patch_uncertainty_penalty,
-                external_boltz_patch_min_confidence=external_boltz_patch_min_confidence,
-                external_boltz_patch_mutation_positions=patch_mutation_positions,
-                max_msa_seqs=max_msa_seqs,
-                sampling_steps_affinity=sampling_steps_affinity,
-                diffusion_samples_affinity=diffusion_samples_affinity,
-                subsample_msa=subsample_msa,
-                num_subsampled_msa=num_subsampled_msa,
-                timeout=prediction_timeout_seconds,
-                use_cached_msa=current_use_cached_msa,  # Skip MSA server when using cache
-                accelerator=accelerator,
-                devices=devices,
-                cuda_visible_devices=cuda_visible_devices,
-                preprocessing_threads=preprocessing_threads,
-                use_potentials=use_potentials,
-                method=method,
-            )
+            with _boltz_job_file_lock(lock_path):
+                utils.run_boltz_prediction(
+                    yaml_filepath=yaml_filepath,
+                    use_gpu=use_gpu,
+                    override=(override or force_override_rebuild),
+                    recycling_steps=recycling_steps,
+                    sampling_steps=sampling_steps,
+                    diffusion_samples=diffusion_samples,
+                    max_parallel_samples=max_parallel_samples,
+                    step_scale=step_scale,
+                    affinity_mw_correction=affinity_mw_correction,
+                    external_boltz_patch_enabled=external_boltz_patch_enabled,
+                    external_boltz_patch_mode=external_boltz_patch_mode,
+                    external_boltz_patch_weight_floor=external_boltz_patch_weight_floor,
+                    external_boltz_patch_entropy_alpha=external_boltz_patch_entropy_alpha,
+                    external_boltz_patch_uncertainty_penalty=external_boltz_patch_uncertainty_penalty,
+                    external_boltz_patch_min_confidence=external_boltz_patch_min_confidence,
+                    external_boltz_patch_mutation_positions=patch_mutation_positions,
+                    max_msa_seqs=max_msa_seqs,
+                    sampling_steps_affinity=sampling_steps_affinity,
+                    diffusion_samples_affinity=diffusion_samples_affinity,
+                    subsample_msa=subsample_msa,
+                    num_subsampled_msa=num_subsampled_msa,
+                    timeout=prediction_timeout_seconds,
+                    use_cached_msa=current_use_cached_msa,  # Skip MSA server when using cache
+                    accelerator=accelerator,
+                    devices=devices,
+                    cuda_visible_devices=cuda_visible_devices,
+                    preprocessing_threads=preprocessing_threads,
+                    use_potentials=use_potentials,
+                    method=method,
+                )
             is_valid, validation_error = validate_boltz_results(yaml_filepath, structure_only=structure_only)
             if not is_valid:
                 raise Exception(f"Results validation failed: {validation_error}")
@@ -1168,37 +1218,38 @@ def run_boltz_with_retry(
                             "ligand": ligand_display_name,
                         },
                     )
-                    utils.run_boltz_prediction(
-                        yaml_filepath=yaml_filepath,
-                        use_gpu=use_gpu,
-                        override=True,
-                        recycling_steps=recycling_steps,
-                        sampling_steps=sampling_steps,
-                        diffusion_samples=diffusion_samples,
-                        max_parallel_samples=max_parallel_samples,
-                        step_scale=step_scale,
-                        affinity_mw_correction=affinity_mw_correction,
-                        external_boltz_patch_enabled=external_boltz_patch_enabled,
-                        external_boltz_patch_mode=external_boltz_patch_mode,
-                        external_boltz_patch_weight_floor=external_boltz_patch_weight_floor,
-                        external_boltz_patch_entropy_alpha=external_boltz_patch_entropy_alpha,
-                        external_boltz_patch_uncertainty_penalty=external_boltz_patch_uncertainty_penalty,
-                        external_boltz_patch_min_confidence=external_boltz_patch_min_confidence,
-                        external_boltz_patch_mutation_positions=patch_mutation_positions,
-                        max_msa_seqs=max_msa_seqs,
-                        sampling_steps_affinity=sampling_steps_affinity,
-                        diffusion_samples_affinity=diffusion_samples_affinity,
-                        subsample_msa=subsample_msa,
-                        num_subsampled_msa=num_subsampled_msa,
-                        timeout=prediction_timeout_seconds,
-                        use_cached_msa=current_use_cached_msa,
-                        accelerator=accelerator,
-                        devices=devices,
-                        cuda_visible_devices=cuda_visible_devices,
-                        preprocessing_threads=preprocessing_threads,
-                        use_potentials=use_potentials,
-                        method=method,
-                    )
+                    with _boltz_job_file_lock(lock_path):
+                        utils.run_boltz_prediction(
+                            yaml_filepath=yaml_filepath,
+                            use_gpu=use_gpu,
+                            override=True,
+                            recycling_steps=recycling_steps,
+                            sampling_steps=sampling_steps,
+                            diffusion_samples=diffusion_samples,
+                            max_parallel_samples=max_parallel_samples,
+                            step_scale=step_scale,
+                            affinity_mw_correction=affinity_mw_correction,
+                            external_boltz_patch_enabled=external_boltz_patch_enabled,
+                            external_boltz_patch_mode=external_boltz_patch_mode,
+                            external_boltz_patch_weight_floor=external_boltz_patch_weight_floor,
+                            external_boltz_patch_entropy_alpha=external_boltz_patch_entropy_alpha,
+                            external_boltz_patch_uncertainty_penalty=external_boltz_patch_uncertainty_penalty,
+                            external_boltz_patch_min_confidence=external_boltz_patch_min_confidence,
+                            external_boltz_patch_mutation_positions=patch_mutation_positions,
+                            max_msa_seqs=max_msa_seqs,
+                            sampling_steps_affinity=sampling_steps_affinity,
+                            diffusion_samples_affinity=diffusion_samples_affinity,
+                            subsample_msa=subsample_msa,
+                            num_subsampled_msa=num_subsampled_msa,
+                            timeout=prediction_timeout_seconds,
+                            use_cached_msa=current_use_cached_msa,
+                            accelerator=accelerator,
+                            devices=devices,
+                            cuda_visible_devices=cuda_visible_devices,
+                            preprocessing_threads=preprocessing_threads,
+                            use_potentials=use_potentials,
+                            method=method,
+                        )
                     is_valid, validation_error = validate_boltz_results(yaml_filepath, structure_only=structure_only)
                     if not is_valid:
                         raise Exception(f"Results validation failed after pre-affinity rebuild: {validation_error}")
@@ -1211,50 +1262,51 @@ def run_boltz_with_retry(
                 and (not structure_only)
                 and run_affinity_multisampling is not None
             ):
-                multi_result = run_affinity_multisampling(
-                    yaml_filepath=yaml_filepath,
-                    use_gpu=use_gpu,
-                    override=False,  # keep structure cached; only refresh affinity output
-                    recycling_steps=recycling_steps,
-                    sampling_steps=sampling_steps,
-                    diffusion_samples=diffusion_samples,
-                    max_parallel_samples=max_parallel_samples,
-                    step_scale=step_scale,
-                    affinity_mw_correction=affinity_mw_correction,
-                    max_msa_seqs=max_msa_seqs,
-                    subsample_msa=subsample_msa,
-                    num_subsampled_msa=num_subsampled_msa,
-                    timeout=prediction_timeout_seconds,
-                    use_cached_msa=current_use_cached_msa,
-                    accelerator=accelerator,
-                    devices=devices,
-                    cuda_visible_devices=cuda_visible_devices,
-                    preprocessing_threads=preprocessing_threads,
-                    use_potentials=use_potentials,
-                    method=method,
-                    external_boltz_patch_enabled=external_boltz_patch_enabled,
-                    external_boltz_patch_mode=external_boltz_patch_mode,
-                    external_boltz_patch_weight_floor=external_boltz_patch_weight_floor,
-                    external_boltz_patch_entropy_alpha=external_boltz_patch_entropy_alpha,
-                    external_boltz_patch_uncertainty_penalty=external_boltz_patch_uncertainty_penalty,
-                    external_boltz_patch_min_confidence=external_boltz_patch_min_confidence,
-                    external_boltz_patch_mutation_positions=patch_mutation_positions,
-                    sampling_steps_affinity_base=sampling_steps_affinity,
-                    diffusion_samples_affinity_base=diffusion_samples_affinity,
-                    profiles=affinity_multisampling_profiles,
-                    refinement_steps=affinity_multisampling_refinement_steps,
-                    aggregate_mode=affinity_multisampling_aggregate_mode,
-                    apply_aggregate=affinity_multisampling_apply_aggregate,
-                    confidence_target=confidence_target,
-                    early_stop_enabled=affinity_multisampling_early_stop_enabled,
-                    early_stop_min_points=affinity_multisampling_early_stop_min_points,
-                    early_stop_delta=affinity_multisampling_early_stop_delta,
-                    early_stop_std=affinity_multisampling_early_stop_std,
-                    early_stop_patience=affinity_multisampling_early_stop_patience,
-                    robust_outlier_filter=affinity_multisampling_robust_outlier_filter,
-                    robust_outlier_zmax=affinity_multisampling_robust_outlier_zmax,
-                    bootstrap_samples=affinity_multisampling_bootstrap_samples,
-                )
+                with _boltz_job_file_lock(lock_path):
+                    multi_result = run_affinity_multisampling(
+                        yaml_filepath=yaml_filepath,
+                        use_gpu=use_gpu,
+                        override=False,  # keep structure cached; only refresh affinity output
+                        recycling_steps=recycling_steps,
+                        sampling_steps=sampling_steps,
+                        diffusion_samples=diffusion_samples,
+                        max_parallel_samples=max_parallel_samples,
+                        step_scale=step_scale,
+                        affinity_mw_correction=affinity_mw_correction,
+                        max_msa_seqs=max_msa_seqs,
+                        subsample_msa=subsample_msa,
+                        num_subsampled_msa=num_subsampled_msa,
+                        timeout=prediction_timeout_seconds,
+                        use_cached_msa=current_use_cached_msa,
+                        accelerator=accelerator,
+                        devices=devices,
+                        cuda_visible_devices=cuda_visible_devices,
+                        preprocessing_threads=preprocessing_threads,
+                        use_potentials=use_potentials,
+                        method=method,
+                        external_boltz_patch_enabled=external_boltz_patch_enabled,
+                        external_boltz_patch_mode=external_boltz_patch_mode,
+                        external_boltz_patch_weight_floor=external_boltz_patch_weight_floor,
+                        external_boltz_patch_entropy_alpha=external_boltz_patch_entropy_alpha,
+                        external_boltz_patch_uncertainty_penalty=external_boltz_patch_uncertainty_penalty,
+                        external_boltz_patch_min_confidence=external_boltz_patch_min_confidence,
+                        external_boltz_patch_mutation_positions=patch_mutation_positions,
+                        sampling_steps_affinity_base=sampling_steps_affinity,
+                        diffusion_samples_affinity_base=diffusion_samples_affinity,
+                        profiles=affinity_multisampling_profiles,
+                        refinement_steps=affinity_multisampling_refinement_steps,
+                        aggregate_mode=affinity_multisampling_aggregate_mode,
+                        apply_aggregate=affinity_multisampling_apply_aggregate,
+                        confidence_target=confidence_target,
+                        early_stop_enabled=affinity_multisampling_early_stop_enabled,
+                        early_stop_min_points=affinity_multisampling_early_stop_min_points,
+                        early_stop_delta=affinity_multisampling_early_stop_delta,
+                        early_stop_std=affinity_multisampling_early_stop_std,
+                        early_stop_patience=affinity_multisampling_early_stop_patience,
+                        robust_outlier_filter=affinity_multisampling_robust_outlier_filter,
+                        robust_outlier_zmax=affinity_multisampling_robust_outlier_zmax,
+                        bootstrap_samples=affinity_multisampling_bootstrap_samples,
+                    )
                 if multi_result.success:
                     results = utils.parse_boltz_results(yaml_filepath, structure_only=structure_only) or results
 
@@ -1309,6 +1361,7 @@ def run_boltz_with_retry(
                 and attempt < max_retry_attempts
             ):
                 force_override_rebuild = True
+                force_clean_rebuild = True
                 notify(
                     "pre_affinity_rebuild_retry",
                     {
@@ -1320,7 +1373,7 @@ def run_boltz_with_retry(
                 )
                 if emit_streamlit_feedback:
                     st.warning(
-                        "Detected missing pre-affinity cache from a prior partial run; retrying with a forced rebuild."
+                        "Detected incomplete cached outputs; retrying this job from a clean output folder."
                     )
                 continue
 
@@ -1882,6 +1935,12 @@ def execute_screening_job(job: ScreeningJob, worker_id: int = 0) -> Tuple[Dict[s
         params["cuda_visible_devices"] = effective_cuda_visible_devices
         params["devices"] = 1
 
+    canonical_project_dir = os.path.join(RESULTS_DIR, job.project_name)
+    isolated_root = os.path.join(canonical_project_dir, "_queue_worker_runs")
+    safe_job_id = str(job.job_id).replace(":", "_").replace("/", "_").replace("\\", "_")
+    isolated_run_dir = os.path.join(isolated_root, f"worker_{int(worker_id)}", safe_job_id)
+    os.makedirs(isolated_run_dir, exist_ok=True)
+
     boltz_results, success, error_message = run_boltz_with_retry(
         workspace_name=job.workspace_name,
         design_name=job.design_name,
@@ -1943,9 +2002,32 @@ def execute_screening_job(job: ScreeningJob, worker_id: int = 0) -> Tuple[Dict[s
         msa_path=msa_path,
         use_cached_msa=use_cached_msa,
         enable_msa_cache=enable_msa_cache,
+        execution_directory=isolated_run_dir,
     )
     if not success or boltz_results is None:
         raise RuntimeError(error_message or "Boltz prediction failed")
+
+    yaml_filename = f"{job.workspace_name}_{job.design_name}.yaml"
+    yaml_name = os.path.splitext(yaml_filename)[0]
+    isolated_yaml_path = os.path.join(isolated_run_dir, yaml_filename)
+    isolated_boltz_dir = os.path.join(isolated_run_dir, f"boltz_results_{yaml_name}")
+    canonical_yaml_path = os.path.join(canonical_project_dir, yaml_filename)
+    canonical_boltz_dir = os.path.join(canonical_project_dir, f"boltz_results_{yaml_name}")
+    publish_lock = os.path.join(canonical_project_dir, f".publish_{yaml_name}.lock")
+
+    os.makedirs(canonical_project_dir, exist_ok=True)
+    with _boltz_job_file_lock(publish_lock):
+        if os.path.exists(canonical_yaml_path):
+            try:
+                os.remove(canonical_yaml_path)
+            except Exception:
+                pass
+        if os.path.exists(canonical_boltz_dir):
+            shutil.rmtree(canonical_boltz_dir, ignore_errors=True)
+        if os.path.exists(isolated_yaml_path):
+            shutil.move(isolated_yaml_path, canonical_yaml_path)
+        if os.path.exists(isolated_boltz_dir):
+            shutil.move(isolated_boltz_dir, canonical_boltz_dir)
 
     result_entry = _create_result_entry(
         protein_name=job.protein_name,
@@ -1960,7 +2042,6 @@ def execute_screening_job(job: ScreeningJob, worker_id: int = 0) -> Tuple[Dict[s
 
     computation_time = time.time() - start_time
     timestamp = datetime.now().isoformat()
-    yaml_filename = f"{job.workspace_name}_{job.design_name}.yaml"
     metadata = {
         "computation_time_seconds": computation_time,
         "timestamp": timestamp,
@@ -3984,13 +4065,13 @@ def main():
         st.header(":material/settings: Configuration")
         
         # Computation Settings
-        st.subheader("Computation Mode")
+        st.subheader("Compute")
         available_gpus = discover_gpu_devices()
         accelerator_choice = st.selectbox(
-            "Accelerator",
+            "Run On",
             options=["GPU", "CPU"],
             index=0,
-            help="Boltz `--accelerator` setting. Use GPU for best throughput.",
+            help="Choose GPU for faster runs, or CPU if no GPU is available.",
         )
         accelerator = accelerator_choice.lower()
         use_gpu = accelerator == "gpu"
@@ -4002,25 +4083,25 @@ def main():
         if use_gpu:
             if len(available_gpus) > 1:
                 gpu_execution_mode = st.selectbox(
-                    "GPU Execution",
+                    "GPU Usage Mode",
                     options=[
                         "Single GPU",
                         "Multi-GPU Queue (One Job per GPU)",
                     ],
                     index=0,
                     help=(
-                        "Single GPU pins jobs to one selected GPU. Multi-GPU Queue runs multiple queue workers, "
-                        "assigning one job per selected GPU for higher throughput."
+                        "Single GPU: run one job at a time on one GPU. "
+                        "Multi-GPU Queue: run multiple jobs in parallel, one per selected GPU."
                     ),
                 )
             gpu_labels = [f"GPU {idx}: {name}" for idx, name in available_gpus]
             if gpu_execution_mode.startswith("Multi-GPU"):
                 default_labels = gpu_labels if gpu_labels else []
                 selected_gpu_labels = st.multiselect(
-                    "GPUs for Queue Workers",
+                    "GPUs to Use",
                     options=gpu_labels,
                     default=default_labels,
-                    help="Selected GPUs will be used by queue workers in round-robin assignment.",
+                    help="Pick which GPUs can run jobs in parallel.",
                 )
                 if not selected_gpu_labels and gpu_labels:
                     selected_gpu_labels = [gpu_labels[0]]
@@ -4039,8 +4120,7 @@ def main():
                     options=gpu_labels_with_auto,
                     index=0,
                     help=(
-                        "Optional GPU pinning via CUDA_VISIBLE_DEVICES. "
-                        "Choose Auto to let the environment decide."
+                        "Pick a specific GPU, or choose Auto to let the system decide."
                     ),
                 )
                 if selected_gpu_label.startswith("GPU "):
@@ -4053,20 +4133,20 @@ def main():
             "Boltz Devices",
             min_value=1,
             value=1,
-            help="Boltz `--devices` value (number of accelerator devices used by the Trainer).",
+            help="How many devices each single Boltz run can use.",
         )
         if gpu_execution_mode.startswith("Multi-GPU"):
             boltz_devices = 1
-            st.caption("Multi-GPU queue mode runs one job per GPU worker; forcing `--devices=1` per job.")
+            st.caption("Multi-GPU queue mode runs one job per GPU.")
         elif use_gpu and cuda_visible_devices not in (None, "", "auto") and boltz_devices > 1:
-            st.caption("Pinned to one GPU device; forcing `--devices=1`.")
+            st.caption("A specific GPU is selected, so each job uses one device.")
             boltz_devices = 1
 
         preprocessing_threads = st.number_input(
             "Preprocessing Threads",
             min_value=1,
             value=max(1, min((os.cpu_count() or 1), 8)),
-            help="Boltz `--preprocessing-threads` for input/MSA preprocessing.",
+            help="CPU threads used to prepare inputs. Higher can be faster, but uses more CPU.",
         )
 
         result_reuse_mode = st.selectbox(
@@ -4086,22 +4166,27 @@ def main():
             "Batch New Jobs (Single Boltz Invocation)",
             value=True,
             help=(
-                "Run pending new jobs in one Boltz directory submission to reduce repeated process startup "
-                "and enable Boltz preprocessing parallelism. Falls back to per-job execution automatically if needed."
+                "Run new jobs together in one launch to reduce startup overhead. "
+                "Automatically falls back to one-by-one if needed."
             ),
         )
-        max_parallel_samples = st.number_input("Max Parallel Samples", min_value=1, value=5, help="Sets the maximum number of samples processed simultaneously. Higher values speed up computation but require more memory.")
+        max_parallel_samples = st.number_input(
+            "Max Parallel Samples",
+            min_value=1,
+            value=5,
+            help="How many samples to process at once in a run. Higher can be faster but uses more memory.",
+        )
 
         # Sampling Settings
-        st.subheader("Structural Sampling")
+        st.subheader("Structure Quality")
         recycling_steps = 4
         sampling_steps = 300
         diffusion_samples = 1
         step_scale = 1.638
-        recycling_steps = st.number_input("Recycling Steps", min_value=1, value=4, help="Sets the number of iterative refinement steps to improve prediction accuracy. Higher values enhance quality but increase computation time.")
-        sampling_steps = st.number_input("Sampling Steps", min_value=1, value=300, help="Defines the number of steps for sampling the model's distribution. More steps improve prediction stability but require more computation.")
-        diffusion_samples = st.number_input("Diffusion Samples", min_value=1, value=1, help="Specifies the number of diffusion samples generated per prediction. Increasing this improves robustness but increases runtime.")
-        step_scale = st.number_input("Step Scale", value=1.638, format="%.3f", help="Controls the sampling temperature of the diffusion process. Lower values (e.g., 1-1.5) increase diversity, while higher values (e.g., 1.5-2) prioritize precision.")
+        recycling_steps = st.number_input("Recycling Steps", min_value=1, value=4, help="Extra refinement rounds for structure prediction. More rounds may improve quality but take longer.")
+        sampling_steps = st.number_input("Sampling Steps", min_value=1, value=300, help="Number of structure sampling steps. More steps are usually more stable but slower.")
+        diffusion_samples = st.number_input("Diffusion Samples", min_value=1, value=1, help="How many structure samples to generate per job. More samples improve robustness but increase runtime.")
+        step_scale = st.number_input("Step Scale", value=1.638, format="%.3f", help="Controls exploration vs precision during sampling. Keep default unless you are tuning.")
 
         # Affinity Prediction Settings
         st.subheader("Affinity Prediction")
@@ -4136,13 +4221,17 @@ def main():
         if structure_only:
             st.caption("Affinity settings are hidden in Structure-only mode.")
         else:
-            affinity_mw_correction = st.toggle("Molecular Weight Correction", value=False, help="If enabled, applies a molecular weight correction to affinity predictions, improving accuracy for certain molecules. Disable for standard predictions.")
+            affinity_mw_correction = st.toggle(
+                "Molecular Weight Correction",
+                value=False,
+                help="Adjusts affinity for molecular size. Leave OFF unless you specifically want this correction.",
+            )
             affinity_multisampling_enabled = st.toggle(
                 "Enable Affinity Multi-Sampling (Structure Once, Affinity Sweep)",
                 value=True,
                 help=(
-                    "Runs one structure prediction, then re-runs only the affinity head at multiple settings. "
-                    "This avoids repeated structure generation."
+                    "Run structure once, then compute affinity at multiple settings. "
+                    "This gives a more robust final score without rerunning structure each time."
                 ),
             )
 
@@ -4154,8 +4243,7 @@ def main():
                     "Multi Sampling Steps (Affinity)",
                     value="200,300,400",
                     help=(
-                        "Comma-separated affinity sampling steps to run in order. "
-                        "Example: 200,300,400. These are the same as your paper settings by default."
+                        "Comma-separated affinity step values. Example: 200,300,400."
                     ),
                 )
                 affinity_multisampling_steps = _parse_positive_int_list_from_text(
@@ -4169,9 +4257,8 @@ def main():
                     "Multi Diffusion Samples (Affinity)",
                     value="5,7,9",
                     help=(
-                        "Comma-separated diffusion samples for each step above (same order). "
-                        "Use one value (example: 7) to apply it to all steps. "
-                        "Leave empty to auto-derive from steps."
+                        "Comma-separated diffusion values matching the steps above (same order). "
+                        "Use one value (example: 7) to apply to all. Leave empty for automatic values."
                     ),
                 )
                 multi_diffusion_values: List[int]
@@ -4352,9 +4439,8 @@ def main():
                     help="Number of diffusion samples for single-run affinity prediction.",
                 )
 
-            # Keep advanced affinity head-fusion and mutation-aware patch disabled in
-            # the default user-facing workflow; multi-sampling full-median is the
-            # exposed strategy for robustness.
+            # Keep the default user-facing affinity workflow focused on
+            # multi-sampling with consensus aggregation.
             affinity_consensus_enabled = False
             external_boltz_patch_enabled = False
 
@@ -5544,24 +5630,32 @@ def main():
                 st.write(f"- Boltz potentials (`--use_potentials`): {'Enabled' if use_potentials else 'Disabled'}")
                 if method:
                     st.write(f"- Method prior (`--method`): {method}")
-            st.write("**:material/sync_alt: Affinity strategy:**")
-            st.write("- User-facing mode: multi-sampling sweep + consensus aggregation")
-            st.write("- Advanced head-consensus and mutation-aware conformer patch: disabled")
             if not structure_only:
-                st.write(f"- Affinity multi-sampling: {'Enabled' if affinity_multisampling_enabled else 'Disabled'}")
+                st.write("**:material/sync_alt: Affinity prediction setup:**")
                 if affinity_multisampling_enabled:
+                    st.write("- Multi-sampling is ON (one structure run, then multiple affinity passes).")
                     profile_text = ", ".join(
                         f"{int(p['sampling_steps_affinity'])}:{int(p['diffusion_samples_affinity'])}"
                         for p in (affinity_multisampling_profiles or [])
                     )
                     st.write(
-                        f"- Multi-sampling profiles (steps:diffusion): "
+                        f"- Settings tested (steps:diffusion): "
                         f"{profile_text or f'{int(sampling_steps_affinity)}:{int(diffusion_samples_affinity)}'}"
                     )
-                    st.write(f"- Aggregate mode: {affinity_multisampling_aggregate_mode}")
-                    st.write(f"- Apply aggregate: {'Yes' if affinity_multisampling_apply_aggregate else 'No'}")
-                    st.write(f"- Early stop: {'On' if affinity_multisampling_early_stop_enabled else 'Off'}")
-                    st.write(f"- Outlier filter: {'On' if affinity_multisampling_robust_outlier_filter else 'Off'}")
+                    if affinity_multisampling_apply_aggregate:
+                        st.write(
+                            f"- Final reported affinity: {str(affinity_multisampling_aggregate_mode).replace('_', ' ')} across tested settings"
+                        )
+                    if affinity_multisampling_early_stop_enabled:
+                        st.write("- Early stop is ON (stops when results stabilize).")
+                    if affinity_multisampling_robust_outlier_filter:
+                        st.write("- Outlier filtering is ON before combining settings.")
+                else:
+                    st.write("- Single affinity setting is ON (no sweep).")
+                    st.write(
+                        f"- Setting (steps:diffusion): "
+                        f"{int(sampling_steps_affinity)}:{int(diffusion_samples_affinity)}"
+                    )
 
             # Display PTM modifications if provided
             ptm_modifications = st.session_state.get('ptm_modifications')
