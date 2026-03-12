@@ -323,6 +323,49 @@ def run_affinity_multisampling(
     yaml_name = yaml_path.stem
     out_root = yaml_path.parent / f"boltz_results_{yaml_name}" / "predictions" / yaml_name
     affinity_path = out_root / f"affinity_{yaml_name}.json"
+    pre_affinity_path = out_root / f"pre_affinity_{yaml_name}.npz"
+
+    def _run_affinity_once(
+        *,
+        sampling_steps_affinity: int,
+        diffusion_samples_affinity: int,
+        force_override: bool,
+    ) -> Dict[str, Any]:
+        utils.run_boltz_prediction(
+            yaml_filepath=yaml_filepath,
+            use_gpu=use_gpu,
+            override=bool(force_override),
+            recycling_steps=recycling_steps,
+            sampling_steps=sampling_steps,
+            diffusion_samples=diffusion_samples,
+            max_parallel_samples=max_parallel_samples,
+            step_scale=step_scale,
+            affinity_mw_correction=affinity_mw_correction,
+            max_msa_seqs=max_msa_seqs,
+            sampling_steps_affinity=int(sampling_steps_affinity),
+            diffusion_samples_affinity=int(diffusion_samples_affinity),
+            subsample_msa=subsample_msa,
+            num_subsampled_msa=num_subsampled_msa,
+            timeout=timeout,
+            use_cached_msa=use_cached_msa,
+            accelerator=accelerator,
+            devices=devices,
+            cuda_visible_devices=cuda_visible_devices,
+            preprocessing_threads=preprocessing_threads,
+            use_potentials=use_potentials,
+            method=method,
+            external_boltz_patch_enabled=external_boltz_patch_enabled,
+            external_boltz_patch_mode=external_boltz_patch_mode,
+            external_boltz_patch_weight_floor=external_boltz_patch_weight_floor,
+            external_boltz_patch_entropy_alpha=external_boltz_patch_entropy_alpha,
+            external_boltz_patch_uncertainty_penalty=external_boltz_patch_uncertainty_penalty,
+            external_boltz_patch_min_confidence=external_boltz_patch_min_confidence,
+            external_boltz_patch_mutation_positions=external_boltz_patch_mutation_positions,
+        )
+        if not affinity_path.exists():
+            raise FileNotFoundError(f"Missing affinity output after rerun: {affinity_path}")
+        return _read_json(affinity_path)
+
     if not affinity_path.exists():
         return MultiSamplingResult(
             success=False,
@@ -340,6 +383,27 @@ def run_affinity_multisampling(
         diffusion_samples_affinity_base=int(diffusion_samples_affinity_base),
     )
     requested_settings = [str(profile["label"]) for profile in sweep_profiles]
+
+    if not pre_affinity_path.exists():
+        try:
+            _run_affinity_once(
+                sampling_steps_affinity=int(sampling_steps_affinity_base),
+                diffusion_samples_affinity=int(diffusion_samples_affinity_base),
+                force_override=True,
+            )
+        except Exception as exc:
+            return MultiSamplingResult(
+                success=False,
+                summary_path=None,
+                aggregated_value=None,
+                aggregated_probability=None,
+                selected_setting=None,
+                message=(
+                    "Missing pre-affinity cache required for affinity-only sweep and "
+                    f"cache rebuild failed: {exc}"
+                ),
+            )
+
     base_data = _read_json(affinity_path)
     initial_steps = int(base_data.get("sampling_steps_affinity", 0) or 0)
     initial_diff = int(base_data.get("diffusion_samples_affinity", 0) or 0)
@@ -371,38 +435,25 @@ def run_affinity_multisampling(
             # structure outputs remain cached and are reused.
             if affinity_path.exists():
                 affinity_path.unlink()
-            utils.run_boltz_prediction(
-                yaml_filepath=yaml_filepath,
-                use_gpu=use_gpu,
-                override=override,
-                recycling_steps=recycling_steps,
-                sampling_steps=sampling_steps,
-                diffusion_samples=diffusion_samples,
-                max_parallel_samples=max_parallel_samples,
-                step_scale=step_scale,
-                affinity_mw_correction=affinity_mw_correction,
-                max_msa_seqs=max_msa_seqs,
-                sampling_steps_affinity=int(profile["sampling_steps_affinity"]),
-                diffusion_samples_affinity=int(profile["diffusion_samples_affinity"]),
-                subsample_msa=subsample_msa,
-                num_subsampled_msa=num_subsampled_msa,
-                timeout=timeout,
-                use_cached_msa=use_cached_msa,
-                accelerator=accelerator,
-                devices=devices,
-                cuda_visible_devices=cuda_visible_devices,
-                preprocessing_threads=preprocessing_threads,
-                use_potentials=use_potentials,
-                method=method,
-                external_boltz_patch_enabled=external_boltz_patch_enabled,
-                external_boltz_patch_mode=external_boltz_patch_mode,
-                external_boltz_patch_weight_floor=external_boltz_patch_weight_floor,
-                external_boltz_patch_entropy_alpha=external_boltz_patch_entropy_alpha,
-                external_boltz_patch_uncertainty_penalty=external_boltz_patch_uncertainty_penalty,
-                external_boltz_patch_min_confidence=external_boltz_patch_min_confidence,
-                external_boltz_patch_mutation_positions=external_boltz_patch_mutation_positions,
-            )
-            setting_data = _read_json(affinity_path)
+            step_now = int(profile["sampling_steps_affinity"])
+            diff_now = int(profile["diffusion_samples_affinity"])
+            try:
+                setting_data = _run_affinity_once(
+                    sampling_steps_affinity=step_now,
+                    diffusion_samples_affinity=diff_now,
+                    force_override=bool(override),
+                )
+            except Exception as exc:
+                message = str(exc)
+                # Recovery path for legacy/incomplete caches missing pre_affinity_*.npz.
+                if ("pre_affinity_" in message) or ("FileNotFoundError" in message):
+                    setting_data = _run_affinity_once(
+                        sampling_steps_affinity=step_now,
+                        diffusion_samples_affinity=diff_now,
+                        force_override=True,
+                    )
+                else:
+                    raise
 
         setting_data["sampling_steps_affinity"] = int(profile["sampling_steps_affinity"])
         setting_data["diffusion_samples_affinity"] = int(profile["diffusion_samples_affinity"])

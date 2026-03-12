@@ -1054,6 +1054,7 @@ def run_boltz_with_retry(
     current_msa_path = msa_path
     current_use_cached_msa = bool(use_cached_msa)
     cache_fallback_triggered = False
+    force_override_rebuild = False
     patch_mutation_positions = (
         _extract_mutation_positions_from_label(protein_display_name)
         if external_boltz_patch_enabled
@@ -1082,10 +1083,35 @@ def run_boltz_with_retry(
                 ptm_modifications,
                 msa_path=current_msa_path,  # MSA caching support
             )
+            yaml_dir = os.path.dirname(yaml_filepath)
+            yaml_name = os.path.splitext(os.path.basename(yaml_filepath))[0]
+            pre_affinity_path = os.path.join(
+                yaml_dir,
+                f"boltz_results_{yaml_name}",
+                "predictions",
+                yaml_name,
+                f"pre_affinity_{yaml_name}.npz",
+            )
+            if (
+                (not structure_only)
+                and (not override)
+                and (not force_override_rebuild)
+                and os.path.exists(os.path.dirname(pre_affinity_path))
+                and (not os.path.exists(pre_affinity_path))
+            ):
+                force_override_rebuild = True
+                notify(
+                    "pre_affinity_rebuild",
+                    {
+                        "attempt": attempt + 1,
+                        "protein": protein_display_name,
+                        "ligand": ligand_display_name,
+                    },
+                )
             utils.run_boltz_prediction(
                 yaml_filepath=yaml_filepath,
                 use_gpu=use_gpu,
-                override=override,
+                override=(override or force_override_rebuild),
                 recycling_steps=recycling_steps,
                 sampling_steps=sampling_steps,
                 diffusion_samples=diffusion_samples,
@@ -1119,6 +1145,66 @@ def run_boltz_with_retry(
             results = utils.parse_boltz_results(yaml_filepath, structure_only=structure_only)
             if results is None:
                 raise Exception("Failed to parse Boltz results")
+
+            # Multi-sampling reruns affinity-only stages that depend on pre_affinity cache.
+            # Even in a fresh project folder, an earlier failed attempt for the same job can
+            # leave a partial output directory missing this artifact.
+            if affinity_multisampling_enabled and (not structure_only):
+                yaml_dir = os.path.dirname(yaml_filepath)
+                yaml_name = os.path.splitext(os.path.basename(yaml_filepath))[0]
+                pre_affinity_path = os.path.join(
+                    yaml_dir,
+                    f"boltz_results_{yaml_name}",
+                    "predictions",
+                    yaml_name,
+                    f"pre_affinity_{yaml_name}.npz",
+                )
+                if not os.path.exists(pre_affinity_path):
+                    notify(
+                        "pre_affinity_rebuild_before_multisampling",
+                        {
+                            "attempt": attempt + 1,
+                            "protein": protein_display_name,
+                            "ligand": ligand_display_name,
+                        },
+                    )
+                    utils.run_boltz_prediction(
+                        yaml_filepath=yaml_filepath,
+                        use_gpu=use_gpu,
+                        override=True,
+                        recycling_steps=recycling_steps,
+                        sampling_steps=sampling_steps,
+                        diffusion_samples=diffusion_samples,
+                        max_parallel_samples=max_parallel_samples,
+                        step_scale=step_scale,
+                        affinity_mw_correction=affinity_mw_correction,
+                        external_boltz_patch_enabled=external_boltz_patch_enabled,
+                        external_boltz_patch_mode=external_boltz_patch_mode,
+                        external_boltz_patch_weight_floor=external_boltz_patch_weight_floor,
+                        external_boltz_patch_entropy_alpha=external_boltz_patch_entropy_alpha,
+                        external_boltz_patch_uncertainty_penalty=external_boltz_patch_uncertainty_penalty,
+                        external_boltz_patch_min_confidence=external_boltz_patch_min_confidence,
+                        external_boltz_patch_mutation_positions=patch_mutation_positions,
+                        max_msa_seqs=max_msa_seqs,
+                        sampling_steps_affinity=sampling_steps_affinity,
+                        diffusion_samples_affinity=diffusion_samples_affinity,
+                        subsample_msa=subsample_msa,
+                        num_subsampled_msa=num_subsampled_msa,
+                        timeout=prediction_timeout_seconds,
+                        use_cached_msa=current_use_cached_msa,
+                        accelerator=accelerator,
+                        devices=devices,
+                        cuda_visible_devices=cuda_visible_devices,
+                        preprocessing_threads=preprocessing_threads,
+                        use_potentials=use_potentials,
+                        method=method,
+                    )
+                    is_valid, validation_error = validate_boltz_results(yaml_filepath, structure_only=structure_only)
+                    if not is_valid:
+                        raise Exception(f"Results validation failed after pre-affinity rebuild: {validation_error}")
+                    results = utils.parse_boltz_results(yaml_filepath, structure_only=structure_only)
+                    if results is None:
+                        raise Exception("Failed to parse Boltz results after pre-affinity rebuild")
 
             if (
                 affinity_multisampling_enabled
@@ -1211,6 +1297,32 @@ def run_boltz_with_retry(
             return results, True, None
         except Exception as e:
             last_error = str(e)
+            missing_pre_affinity_cache = (
+                "pre_affinity_" in last_error.lower()
+                and "not found" in last_error.lower()
+            )
+            if (
+                (not structure_only)
+                and missing_pre_affinity_cache
+                and (not override)
+                and (not force_override_rebuild)
+                and attempt < max_retry_attempts
+            ):
+                force_override_rebuild = True
+                notify(
+                    "pre_affinity_rebuild_retry",
+                    {
+                        "attempt": attempt + 1,
+                        "protein": protein_display_name,
+                        "ligand": ligand_display_name,
+                        "error": last_error[:200],
+                    },
+                )
+                if emit_streamlit_feedback:
+                    st.warning(
+                        "Detected missing pre-affinity cache from a prior partial run; retrying with a forced rebuild."
+                    )
+                continue
 
             # Robust fallback: some cached-MSA runs can complete structure/confidence
             # yet miss affinity output; retry with fresh MSA generation.
