@@ -4,6 +4,7 @@ streamlit==1.45.0
 # Data Processing and Analysis
 pandas==2.2.2
 numpy==1.26.4
+pysam==0.22.1
 
 # Visualization
 plotly==6.0.1
@@ -26,3 +27,6 @@ chembl-webresource-client
 
 # Boltz2 (using 2.0.3 to avoid cuequivariance_ops GPU compatibility issues)
 boltz[cuda]==2.0.3
+
+# Structure refinement (energy minimization)
+openmm==8.3
