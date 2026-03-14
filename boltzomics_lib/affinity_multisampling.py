@@ -438,6 +438,64 @@ def run_affinity_multisampling(
         label = str(profile["label"])
         step_now = int(profile["sampling_steps_affinity"])
         diff_now = int(profile["diffusion_samples_affinity"])
+        # Baseline affinity for one profile is already available from the
+        # initial run in run_boltz_with_retry(). Reuse it instead of launching
+        # an extra boltz predict call for the same profile.
+        if current_label is not None and label == current_label:
+            setting_data = dict(base_data)
+            setting_data["sampling_steps_affinity"] = int(profile["sampling_steps_affinity"])
+            setting_data["diffusion_samples_affinity"] = int(profile["diffusion_samples_affinity"])
+            per_setting[label] = setting_data
+            executed_settings.append(label)
+            setting_copy = out_root / f"affinity_{yaml_name}_setting_{label}.json"
+            _write_json(setting_copy, setting_data)
+
+            if early_stop_enabled:
+                value_now = _safe_float(setting_data.get("affinity_pred_value"))
+                if value_now is not None:
+                    running_values.append(float(value_now))
+                if (
+                    idx < (len(sweep_profiles) - 1)
+                    and len(running_values) >= max(2, int(early_stop_min_points))
+                ):
+                    running_arr = np.array(running_values, dtype=float)
+                    running_agg = _aggregate(running_arr, aggregate_mode)
+                    running_std = (
+                        float(np.std(running_arr, ddof=1))
+                        if running_arr.size > 1
+                        else 0.0
+                    )
+                    delta = (
+                        abs(float(running_agg) - float(prev_running_agg))
+                        if prev_running_agg is not None
+                        else None
+                    )
+                    running_trace.append(
+                        {
+                            "setting": label,
+                            "n": int(running_arr.size),
+                            "running_aggregate": float(running_agg),
+                            "running_std": float(running_std),
+                            "delta_vs_prev": float(delta) if delta is not None else None,
+                        }
+                    )
+                    if (
+                        delta is not None
+                        and float(delta) <= float(max(0.0, early_stop_delta))
+                        and float(running_std) <= float(max(0.0, early_stop_std))
+                    ):
+                        convergence_streak += 1
+                    else:
+                        convergence_streak = 0
+                    prev_running_agg = float(running_agg)
+
+                    if convergence_streak >= max(1, int(early_stop_patience)):
+                        early_stop_triggered = True
+                        skipped_due_convergence = [
+                            str(item["label"]) for item in sweep_profiles[idx + 1 :]
+                        ]
+                        break
+            continue
         try:
             if not force_override_setting_runs:
                 _invalidate_affinity_outputs_for_profile()
