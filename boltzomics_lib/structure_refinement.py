@@ -184,6 +184,27 @@ def minimize_structure_openmm(
         if output_path is None:
             base = os.path.splitext(pdb_path)[0]
             output_path = f"{base}_minimized.pdb"
+        output_path = str(output_path)
+
+        if not os.path.exists(pdb_path):
+            raise FileNotFoundError(f"PDB not found: {pdb_path}")
+        if os.path.getsize(pdb_path) == 0:
+            raise ValueError(f"Input PDB is empty: {pdb_path}")
+
+        # Never write directly into the input path. For in-place relaxation
+        # requests, write to a temp file and atomically replace at the end.
+        inplace_update = os.path.abspath(output_path) == os.path.abspath(pdb_path)
+        write_path = output_path
+        if inplace_update:
+            out_dir = os.path.dirname(output_path) or "."
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                prefix=".tmp_minimized_",
+                suffix=".pdb",
+                dir=out_dir,
+                delete=False,
+            ) as tmp_handle:
+                write_path = tmp_handle.name
 
         # Load the structure
         logger.info(f"Loading structure from {pdb_path}")
@@ -191,7 +212,7 @@ def minimize_structure_openmm(
 
         # Create modeller for preprocessing
         modeller = Modeller(pdb.topology, pdb.positions)
-        removed_residues: List[Tuple[int, str, str, str]] = []
+        removed_residues: List[Tuple[Optional[int], str, str, str]] = []
 
         # Use Amber force field (good for proteins)
         # For ligands, we need GAFF - use implicit solvent for simplicity
@@ -220,9 +241,16 @@ def minimize_structure_openmm(
             except Exception as create_exc:
                 template_idx = _extract_template_error_residue_index(str(create_exc))
                 residues = list(modeller.topology.residues())
-                if template_idx is None or template_idx < 0 or template_idx >= len(residues):
+                bad_res = None
+                if template_idx is not None and 0 <= template_idx < len(residues):
+                    bad_res = residues[template_idx]
+                elif template_idx is None:
+                    # Some OpenMM versions/errors (including occasional index errors)
+                    # omit residue indices. Fall back to removing likely nonstandard
+                    # residues one-by-one to recover minimization.
+                    bad_res = _pick_fallback_unparameterized_residue(residues)
+                if bad_res is None:
                     raise
-                bad_res = residues[template_idx]
                 removed_residues.append((template_idx, bad_res.name, bad_res.id, bad_res.chain.id))
                 logger.warning(
                     "Removing unparameterized residue during minimization fallback: "
@@ -236,6 +264,41 @@ def minimize_structure_openmm(
 
         if system is None:
             raise RuntimeError("Failed to create OpenMM system after template fallback retries.")
+
+        # If ligand had to be removed for force-field compatibility, add light
+        # coordinate restraints to protein heavy atoms to reduce pocket collapse
+        # into the fixed ligand coordinates used by the clash guard.
+        removed_names = {str(name).strip().upper() for _, name, _, _ in removed_residues}
+        if "LIG" in removed_names:
+            restraint = openmm.CustomExternalForce(
+                "0.5*k*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)"
+            )
+            restraint.addGlobalParameter(
+                "k", 40.0 * unit.kilojoule_per_mole / (unit.nanometer ** 2)
+            )
+            restraint.addPerParticleParameter("x0")
+            restraint.addPerParticleParameter("y0")
+            restraint.addPerParticleParameter("z0")
+            restrained_atoms = 0
+            for atom in modeller.topology.atoms():
+                if atom.element is None:
+                    continue
+                if atom.element.symbol == "H":
+                    continue
+                if atom.residue.name == "LIG":
+                    continue
+                if atom.name not in ("N", "CA", "C", "O"):
+                    continue
+                xyz0 = modeller.positions[atom.index].value_in_unit(unit.nanometer)
+                restraint.addParticle(atom.index, [float(xyz0[0]), float(xyz0[1]), float(xyz0[2])])
+                restrained_atoms += 1
+            if restrained_atoms > 0:
+                system.addForce(restraint)
+                logger.info(
+                    "Applied positional restraints to %d backbone heavy atoms "
+                    "because ligand was excluded from minimization system.",
+                    restrained_atoms,
+                )
 
         # Create integrator (not used for minimization but required)
         integrator = LangevinMiddleIntegrator(
@@ -314,9 +377,13 @@ def minimize_structure_openmm(
                 baseline_n_lt_1_6A = int((baseline_ligand_metrics or {}).get("n_lt_1_6A", 0))
                 candidate_n_lt_2A = int(candidate_metrics.get("n_lt_2A", 0))
                 candidate_n_lt_1_6A = int(candidate_metrics.get("n_lt_1_6A", 0))
+                baseline_min_dist = float((baseline_ligand_metrics or {}).get("min_dist_A", float("inf")))
+                candidate_min_dist = float(candidate_metrics.get("min_dist_A", float("inf")))
                 worsened = (
                     candidate_n_lt_1_6A > baseline_n_lt_1_6A
                     or candidate_n_lt_2A > baseline_n_lt_2A
+                    # Also reject subtle encroachment that may not change counts.
+                    or candidate_min_dist < (baseline_min_dist - 0.10)
                 )
 
                 if worsened:
@@ -360,7 +427,7 @@ def minimize_structure_openmm(
         if removed_residues:
             _write_minimized_coords_preserve_original_records(
                 original_pdb_path=pdb_path,
-                output_pdb_path=output_path,
+                output_pdb_path=write_path,
                 topology=modeller.topology,
                 positions=final_positions,
                 unit_module=unit,
@@ -371,8 +438,11 @@ def minimize_structure_openmm(
                 len(removed_residues),
             )
         else:
-            with open(output_path, 'w') as f:
+            with open(write_path, 'w') as f:
                 PDBFile.writeFile(modeller.topology, final_positions, f)
+
+        if inplace_update and write_path != output_path:
+            os.replace(write_path, output_path)
 
         return RefinementResult(
             original_pdb_path=pdb_path,
@@ -417,6 +487,38 @@ def _extract_template_error_residue_index(error_text: str) -> Optional[int]:
         return None
 
 
+def _is_openmm_standard_residue_name(res_name: str) -> bool:
+    """Heuristic set of residue names typically parameterized by bundled Amber files."""
+    standard_names = {
+        # Canonical amino acids
+        "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+        "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+        # Common histidine/terminal variants
+        "HID", "HIE", "HIP", "ASH", "GLH", "LYN", "CYX", "CYM",
+        "NALA", "NARG", "NASN", "NASP", "NCYS", "NGLN", "NGLU", "NGLY", "NHID",
+        "NHIE", "NHIP", "NILE", "NLEU", "NLYS", "NMET", "NPHE", "NPRO", "NSER",
+        "NTHR", "NTRP", "NTYR", "NVAL",
+        "CALA", "CARG", "CASN", "CASP", "CCYS", "CGLN", "CGLU", "CGLY", "CHID",
+        "CHIE", "CHIP", "CILE", "CLEU", "CLYS", "CMET", "CPHE", "CPRO", "CSER",
+        "CTHR", "CTRP", "CTYR", "CVAL",
+        # Waters and common ions in Amber XMLs
+        "HOH", "WAT", "TIP3", "TIP3P", "NA", "K", "CL", "MG", "CA", "ZN",
+    }
+    return str(res_name).strip().upper() in standard_names
+
+
+def _pick_fallback_unparameterized_residue(residues) -> Optional[Any]:
+    """
+    Pick a likely unparameterized residue when OpenMM error text lacks a residue index.
+
+    Prefer nonstandard residues (commonly ligands/cofactors) while preserving protein chain.
+    """
+    for residue in residues:
+        if not _is_openmm_standard_residue_name(getattr(residue, "name", "")):
+            return residue
+    return None
+
+
 def _make_atom_coord_key(atom) -> Tuple[str, str, str, str]:
     """Build a stable coordinate key from OpenMM topology atom metadata."""
     residue = atom.residue
@@ -447,9 +549,13 @@ def _write_minimized_coords_preserve_original_records(
         key = _make_atom_coord_key(atom)
         coord_map[key] = (float(xyz[0]), float(xyz[1]), float(xyz[2]))
 
-    with open(original_pdb_path, "r", encoding="utf-8", errors="ignore") as src, \
-            open(output_pdb_path, "w", encoding="utf-8") as dst:
-        for line in src:
+    # Read original lines first so same-path rewrites cannot truncate input
+    # before coordinate transfer (defensive safeguard).
+    with open(original_pdb_path, "r", encoding="utf-8", errors="ignore") as src:
+        original_lines = list(src)
+
+    with open(output_pdb_path, "w", encoding="utf-8") as dst:
+        for line in original_lines:
             record = line[:6]
             if record in ("ATOM  ", "HETATM"):
                 if len(line) >= 54:
@@ -529,12 +635,16 @@ def _protein_ligand_clash_metrics(
         positions_angstrom = positions
 
     protein_coords: List[Tuple[float, float, float]] = []
+    n_positions = len(positions_angstrom)
     for atom in topology.atoms():
         if atom.element is None:
             continue
         if atom.element.symbol == "H":
             continue
         if atom.residue.name == "LIG":
+            continue
+        if atom.index >= n_positions:
+            # Defensive guard for rare topology/positions mismatches.
             continue
         xyz = positions_angstrom[atom.index]
         protein_coords.append((float(xyz[0]), float(xyz[1]), float(xyz[2])))

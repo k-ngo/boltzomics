@@ -325,6 +325,22 @@ def run_affinity_multisampling(
     # Multi-device Boltz runs can race on pre_affinity cache visibility.
     # In that mode, force --override on each setting for deterministic rebuild.
     force_override_multidevice = int(devices) > 1
+    # For setting sweeps, refresh affinity outputs per profile while preserving
+    # cached structure/pre_affinity artifacts.
+    force_override_setting_runs = False
+
+    def _invalidate_affinity_outputs_for_profile() -> None:
+        """Remove affinity-only outputs so Boltz recomputes affinity stage."""
+        targets = [
+            affinity_path,
+            out_root / f"affinity_multisampling_{yaml_name}.json",
+        ]
+        for path in targets:
+            try:
+                if path.exists():
+                    path.unlink()
+            except Exception:
+                pass
 
     def _run_affinity_once(
         *,
@@ -400,7 +416,7 @@ def run_affinity_multisampling(
     base_data = _read_json(affinity_path)
     initial_steps = int(base_data.get("sampling_steps_affinity", 0) or 0)
     initial_diff = int(base_data.get("diffusion_samples_affinity", 0) or 0)
-    current_label = None
+    current_label: Optional[str] = None
     for profile in sweep_profiles:
         label = str(profile["label"])
         if (
@@ -409,7 +425,6 @@ def run_affinity_multisampling(
         ):
             current_label = label
             break
-
     per_setting: Dict[str, Dict[str, Any]] = {}
     executed_settings: List[str] = []
     skipped_due_convergence: List[str] = []
@@ -421,40 +436,47 @@ def run_affinity_multisampling(
 
     for idx, profile in enumerate(sweep_profiles):
         label = str(profile["label"])
-        if label == current_label:
-            setting_data = dict(base_data)
-        else:
-            step_now = int(profile["sampling_steps_affinity"])
-            diff_now = int(profile["diffusion_samples_affinity"])
-            try:
-                setting_data = _run_affinity_once(
-                    sampling_steps_affinity=step_now,
-                    diffusion_samples_affinity=diff_now,
-                    force_override=(True if force_override_multidevice else bool(override)),
-                )
-            except Exception as exc:
-                message = str(exc)
-                # Recovery path for legacy/incomplete caches missing pre_affinity_*.npz.
-                if ("pre_affinity_" in message) or ("FileNotFoundError" in message):
-                    try:
-                        setting_data = _run_affinity_once(
-                            sampling_steps_affinity=step_now,
-                            diffusion_samples_affinity=diff_now,
-                            force_override=(True if force_override_multidevice else bool(override)),
-                        )
-                    except Exception:
-                        # Last-resort recovery: remove stale output dir for this YAML and rebuild.
-                        output_dir = yaml_path.parent / f"boltz_results_{yaml_name}"
-                        if output_dir.exists():
-                            import shutil
-                            shutil.rmtree(output_dir, ignore_errors=True)
-                        setting_data = _run_affinity_once(
-                            sampling_steps_affinity=step_now,
-                            diffusion_samples_affinity=diff_now,
-                            force_override=True,
-                        )
-                else:
-                    raise
+        step_now = int(profile["sampling_steps_affinity"])
+        diff_now = int(profile["diffusion_samples_affinity"])
+        try:
+            if not force_override_setting_runs:
+                _invalidate_affinity_outputs_for_profile()
+            setting_data = _run_affinity_once(
+                sampling_steps_affinity=step_now,
+                diffusion_samples_affinity=diff_now,
+                force_override=(
+                    True
+                    if force_override_setting_runs
+                    else (True if force_override_multidevice else bool(override))
+                ),
+            )
+        except Exception as exc:
+            message = str(exc)
+            # Recovery path for legacy/incomplete caches missing pre_affinity_*.npz.
+            if ("pre_affinity_" in message) or ("FileNotFoundError" in message):
+                try:
+                    setting_data = _run_affinity_once(
+                        sampling_steps_affinity=step_now,
+                        diffusion_samples_affinity=diff_now,
+                        force_override=(
+                            True
+                            if force_override_setting_runs
+                            else (True if force_override_multidevice else bool(override))
+                        ),
+                    )
+                except Exception:
+                    # Last-resort recovery: remove stale output dir for this YAML and rebuild.
+                    output_dir = yaml_path.parent / f"boltz_results_{yaml_name}"
+                    if output_dir.exists():
+                        import shutil
+                        shutil.rmtree(output_dir, ignore_errors=True)
+                    setting_data = _run_affinity_once(
+                        sampling_steps_affinity=step_now,
+                        diffusion_samples_affinity=diff_now,
+                        force_override=True,
+                    )
+            else:
+                raise
 
         setting_data["sampling_steps_affinity"] = int(profile["sampling_steps_affinity"])
         setting_data["diffusion_samples_affinity"] = int(profile["diffusion_samples_affinity"])

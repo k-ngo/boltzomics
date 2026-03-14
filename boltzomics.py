@@ -99,11 +99,6 @@ except ImportError:
     quick_property_check = None
 
 try:
-    from mutation_local_consistency import annotate_results_with_mutation_local_consistency
-except ImportError:
-    annotate_results_with_mutation_local_consistency = None
-
-try:
     from affinity_multisampling import run_affinity_multisampling
 except ImportError:
     run_affinity_multisampling = None
@@ -1946,6 +1941,7 @@ def execute_screening_job(job: ScreeningJob, worker_id: int = 0) -> Tuple[Dict[s
     params = job.parameters or {}
     ligand_smiles = "" if job.structure_only else job.smiles
     ligand_display_name = "" if job.structure_only else job.drug_name
+    yaml_filename = f"{job.workspace_name}_{job.design_name}.yaml"
     start_time = time.time()
     enable_msa_cache = bool(params.get("enable_msa_cache", True))
     wt_sequence_for_msa_cache = params.get("wt_sequence_for_msa_cache")
@@ -3380,27 +3376,28 @@ def display_results_table(results: List[Dict]):
         "affinity_pred_value_raw" in df.columns
         and pd.to_numeric(df["affinity_pred_value_raw"], errors="coerce").notna().any()
     )
-    default_affinity_source_index = 1 if has_consensus_values else 0
-    affinity_value_source = st.radio(
-        "Affinity Value Source for Tables",
-        options=[
-            "Raw single-setting output",
-            "Consensus output (multi-sampling aggregate when available)",
-        ],
-        index=default_affinity_source_index,
-        horizontal=True,
-        help=(
-            "Controls which affinity estimate is shown in IC50/pIC50 tables. "
-            "Consensus uses the configured aggregate (for example full median) when present. "
-            "Rows without that source fall back to available values."
-        ),
-    )
-    source_mode = "consensus" if affinity_value_source.startswith("Consensus") else "raw"
+    source_mode = "raw"
+    if has_consensus_values:
+        default_affinity_source_index = 1
+        affinity_value_source = st.radio(
+            "Affinity Value Source for Tables",
+            options=[
+                "Raw single-setting output",
+                "Consensus output (multi-sampling aggregate when available)",
+            ],
+            index=default_affinity_source_index,
+            horizontal=True,
+            help=(
+                "Controls which affinity estimate is shown in IC50/pIC50 tables. "
+                "Consensus uses the configured aggregate (for example full median) when present. "
+                "Rows without that source fall back to available values."
+            ),
+        )
+        source_mode = "consensus" if affinity_value_source.startswith("Consensus") else "raw"
 
     display_ic50_values = []
     display_pic50_values = []
     display_prob_values = []
-    display_source_labels = []
     for row in df.to_dict(orient="records"):
         raw_pred = _to_float_local(row.get("affinity_pred_value_raw"))
         consensus_pred = _to_float_local(row.get("affinity_pred_value_consensus"))
@@ -3443,12 +3440,10 @@ def display_results_table(results: List[Dict]):
         display_ic50_values.append(row_ic50)
         display_pic50_values.append(row_pic50)
         display_prob_values.append(selected_prob)
-        display_source_labels.append(selected_label)
 
     df.loc[:, "ic50_um"] = display_ic50_values
     df.loc[:, "pic50"] = display_pic50_values
     df.loc[:, "affinity_probability"] = display_prob_values
-    df.loc[:, "affinity_value_source"] = display_source_labels
     
     # Create summary table with IC50 for each drug and protein combination
     if len(deduplicated_results) > 0:
@@ -3567,9 +3562,7 @@ def display_results_table(results: List[Dict]):
     # Reorder columns to move protein_sequence, SMILES, and status to the end (exclude workspace and design)
     column_order = [
         "protein_name", "drug_name", "ic50_um", "pic50", "affinity_probability", 
-        "affinity_value_source",
-        "confidence", "mutation_local_consistency_score", "mutation_local_consistency_label",
-        "mutation_local_fingerprint_similarity", "mutation_local_disruption_score",
+        "confidence",
         "ptm", "iptm", "avg_plddt",
         "protein_sequence", "smiles", "status"
     ]
@@ -3596,33 +3589,7 @@ def display_results_table(results: List[Dict]):
             "ic50_um": st.column_config.NumberColumn("IC50 (μM)", format="%.4f"),
             "pic50": st.column_config.NumberColumn("pIC50", format="%.3f"),
             "affinity_probability": st.column_config.NumberColumn("Affinity Prob", format="%.3f"),
-            "affinity_value_source": st.column_config.TextColumn(
-                "Affinity Source",
-                width="medium",
-                help=(
-                    "Indicates whether displayed IC50/pIC50 came from raw single-setting output "
-                    "or consensus aggregate (for example full median)."
-                ),
-            ),
             "confidence": st.column_config.NumberColumn("Confidence", format="%.3f"),
-            "mutation_local_consistency_score": st.column_config.NumberColumn(
-                "Mut Local Consistency",
-                format="%.3f",
-                help="0-1 score comparing WT vs mutant local interaction consistency for the same drug.",
-            ),
-            "mutation_local_consistency_label": st.column_config.TextColumn(
-                "Consistency Label",
-                width="small",
-            ),
-            "mutation_local_fingerprint_similarity": st.column_config.NumberColumn(
-                "FP Similarity",
-                format="%.3f",
-            ),
-            "mutation_local_disruption_score": st.column_config.NumberColumn(
-                "Disruption",
-                format="%.3f",
-                help="Higher values indicate larger WT vs mutant interface disruption.",
-            ),
             "ptm": st.column_config.NumberColumn("pTM", format="%.3f"),
             "iptm": st.column_config.NumberColumn("ipTM", format="%.3f"),
             "avg_plddt": st.column_config.NumberColumn("Avg pLDDT", format="%.1f"),
@@ -4843,7 +4810,6 @@ def main():
         mutation_steering_enable_potentials = True
         method_prior_label = "None"
         method_prior_value: Optional[str] = None
-        compute_mutation_local_consistency = False
 
         tab_mutation, tab1, tab2, tab3, tab4, tab5 = st.tabs([
             ":material/biotech: Mutation Discovery",
@@ -4918,16 +4884,6 @@ def main():
                     st.info("Mutation steering is disabled in structure-only mode.")
                 elif input_mode != "Mutation Mode":
                     st.info("Switch to Mutation Mode to enable mutation-conditioned steering.")
-                compute_mutation_local_consistency = st.toggle(
-                    "Compute Mutation-Local Consistency Score",
-                    value=False,
-                    disabled=structure_only or input_mode != "Mutation Mode",
-                    help=(
-                        "Compares each mutant pose against WT (same drug) using interaction fingerprints "
-                        "and disruption metrics, then reports a 0-1 local consistency score."
-                    ),
-                )
-
         # Tab 1: Co-factors
         with tab1:
             # Show current cofactor info if available
@@ -5134,7 +5090,6 @@ def main():
         "chain_starts": dict(mutation_chain_starts),
     }
     st.session_state["mutation_steering_config"] = mutation_steering_config
-    st.session_state["compute_mutation_local_consistency"] = bool(compute_mutation_local_consistency)
     use_potentials = bool(mutation_steering_enabled and mutation_steering_enable_potentials)
     method = method_prior_value if mutation_steering_enabled else None
     
@@ -5818,32 +5773,6 @@ def main():
         synchronize_job_results(project_name)
         queue_summary = render_job_queue_status(project_name)
         maybe_schedule_queue_autorefresh(queue_summary)
-
-    # Optional post-processing: mutation-local consistency annotation.
-    active_project_name = project_name or st.session_state.get("loaded_project_name")
-    if (
-        annotate_results_with_mutation_local_consistency is not None
-        and not structure_only
-        and active_project_name
-        and hasattr(st.session_state, "screening_results")
-        and st.session_state.screening_results
-        and st.session_state.get("compute_mutation_local_consistency", False)
-    ):
-        cache = st.session_state.get("_mutation_local_consistency_cache", {})
-        annotated_results, cache, consistency_summary = annotate_results_with_mutation_local_consistency(
-            results=st.session_state.screening_results,
-            project_name=active_project_name,
-            enabled=True,
-            cache=cache,
-        )
-        st.session_state._mutation_local_consistency_cache = cache
-        st.session_state.screening_results = annotated_results
-        if consistency_summary.get("annotated", 0) > 0:
-            st.caption(
-                "Mutation-local consistency annotated: "
-                f"{consistency_summary['annotated']} entries "
-                f"(errors: {consistency_summary.get('errors', 0)})."
-            )
 
     # Display screening processing summary outside of columns
     if hasattr(st.session_state, 'screening_results') and st.session_state.screening_results:

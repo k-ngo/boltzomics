@@ -19,11 +19,6 @@ except Exception as _variables_exc:  # pragma: no cover - optional dependency
     _VARIABLES_IMPORT_ERROR = str(_variables_exc)
 
 try:
-    from mutation_local_consistency import annotate_results_with_mutation_local_consistency  # type: ignore
-except Exception:
-    annotate_results_with_mutation_local_consistency = None
-
-try:
     from structure_refinement import (  # type: ignore
         quick_interface_check,
         compare_wt_mutant_quick,
@@ -145,8 +140,6 @@ def get_available_pdb_poses(results, project_name):
                 "ptm": entry.get("ptm"),
                 "iptm": entry.get("iptm"),
                 "avg_plddt": entry.get("avg_plddt"),
-                "mutation_local_consistency_score": entry.get("mutation_local_consistency_score"),
-                "mutation_local_consistency_label": entry.get("mutation_local_consistency_label"),
                 "cofactor_info": entry.get("cofactor_info"),
             }
         )
@@ -474,21 +467,22 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
             "affinity_pred_value_consensus" in df.columns
             and pd.to_numeric(df["affinity_pred_value_consensus"], errors="coerce").notna().any()
         )
-        default_affinity_source_index = 1 if has_consensus_values else 0
-        affinity_value_source = st.radio(
-            "Affinity Value Source for Plots",
-            options=[
-                "Raw single-setting output",
-                "Consensus output (multi-sampling aggregate when available)",
-            ],
-            index=default_affinity_source_index,
-            horizontal=True,
-            help=(
-                "Controls pIC50/IC50 and affinity probability values used in plots. "
-                "Consensus uses the configured aggregate (for example full median) when available."
-            ),
-        )
-        source_mode = "consensus" if affinity_value_source.startswith("Consensus") else "raw"
+        source_mode = "raw"
+        if has_consensus_values:
+            affinity_value_source = st.radio(
+                "Affinity Value Source for Plots",
+                options=[
+                    "Raw single-setting output",
+                    "Consensus output (multi-sampling aggregate when available)",
+                ],
+                index=1,
+                horizontal=True,
+                help=(
+                    "Controls pIC50/IC50 and affinity probability values used in plots. "
+                    "Consensus uses the configured aggregate (for example full median) when available."
+                ),
+            )
+            source_mode = "consensus" if affinity_value_source.startswith("Consensus") else "raw"
     else:
         source_mode = "raw"
 
@@ -636,67 +630,6 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
     # First tab: Combined Results
     with tabs[0]:
         st.subheader(":material/analytics: Combined Analysis")
-        st.caption(
-            "Mutation-local consistency is configured in Advanced Options -> Mutation Discovery -> "
-            "`Compute Mutation-Local Consistency Score`."
-        )
-
-        consistency_col = "mutation_local_consistency_score"
-        consistency_available = consistency_col in df_safe.columns and df_safe[consistency_col].notna().any()
-        if consistency_available:
-            consistency_series = pd.to_numeric(df_safe[consistency_col], errors="coerce").dropna()
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.metric(
-                    "Mutation-Local Entries",
-                    int(consistency_series.shape[0]),
-                    help="Number of predictions with WT-vs-mutant local interaction consistency annotation.",
-                )
-            with c2:
-                st.metric(
-                    "Mean Local Consistency",
-                    f"{float(consistency_series.mean()):.3f}",
-                    help="0-1 score; higher means the mutant keeps WT-like local interactions better.",
-                )
-            with c3:
-                high_count = int((consistency_series >= 0.75).sum())
-                st.metric(
-                    "High Consistency (>=0.75)",
-                    high_count,
-                    help="Count of entries with high local interaction consistency.",
-                )
-        else:
-            st.info(
-                "Mutation-local consistency is not present in current results. "
-                "You can enable it before running, or compute it now for the loaded project."
-            )
-            project_name_for_consistency = st.session_state.get("loaded_project_name")
-            can_compute_now = (
-                annotate_results_with_mutation_local_consistency is not None
-                and bool(project_name_for_consistency)
-                and hasattr(st.session_state, "screening_results")
-                and bool(st.session_state.screening_results)
-            )
-            if can_compute_now and st.button(
-                "Compute Mutation-Local Consistency Now",
-                key="combined_compute_mutation_local_consistency_now",
-                help="Runs WT-vs-mutant local interaction comparison on current results and refreshes Combined Analysis.",
-            ):
-                cache = st.session_state.get("_mutation_local_consistency_cache", {})
-                updated_results, cache, summary = annotate_results_with_mutation_local_consistency(
-                    results=list(st.session_state.screening_results),
-                    project_name=str(project_name_for_consistency),
-                    enabled=True,
-                    cache=cache,
-                )
-                st.session_state._mutation_local_consistency_cache = cache
-                st.session_state.screening_results = updated_results
-                st.success(
-                    "Mutation-local consistency computed: "
-                    f"{int(summary.get('annotated', 0))} annotated, "
-                    f"{int(summary.get('errors', 0))} errors."
-                )
-                st.rerun()
 
         # Add multiselects for filtering
         protein_options = df_safe["protein_name"].unique().tolist()
@@ -1059,6 +992,8 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
         selected_pdb = None
         displayed_pdb = None
         relaxed_pdb = None
+        relaxed_exists = False
+        relaxation_meta = None
         viewer_mode = "Original"
         
         with left_col:      
@@ -1083,9 +1018,9 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
             
             if selected_pose:
                 if not structure_only:
+                    st.caption(f"Protein: {selected_pose['protein_name']} | Drug: {selected_pose['drug_name']}")
                     col1, col2, col3 = st.columns(3)
                     with col1:
-                        st.metric("Protein", selected_pose['protein_name'])
                         if selected_pose.get("pic50") is not None:
                             st.metric(
                                 "pIC50",
@@ -1093,7 +1028,6 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                                 help=METRIC_DESCRIPTIONS.get("pic50", "Predicted binding potency (higher is better)."),
                             )
                     with col2:
-                        st.metric("Drug", selected_pose['drug_name'])
                         if selected_pose.get("confidence") is not None:
                             st.metric(
                                 "Confidence",
@@ -1101,38 +1035,12 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                                 help=CONFIDENCE_HELP_TEXT,
                             )
                     with col3:
-                        if selected_pose.get("ptm") is not None:
-                            st.metric(
-                                "pTM",
-                                f"{float(selected_pose['ptm']):.3f}",
-                                help=METRIC_DESCRIPTIONS.get("ptm", "Predicted global fold quality (0-1)."),
-                            )
-                        if selected_pose.get("iptm") is not None:
-                            st.metric(
-                                "ipTM",
-                                f"{float(selected_pose['iptm']):.3f}",
-                                help=METRIC_DESCRIPTIONS.get("iptm", "Predicted interface quality (0-1)."),
-                            )
                         if selected_pose.get("avg_plddt") is not None:
                             st.metric(
                                 "Avg pLDDT",
                                 f"{float(selected_pose['avg_plddt']):.1f}",
                                 help=METRIC_DESCRIPTIONS.get("plddt", "Average per-residue confidence (0-100)."),
                             )
-                    local_consistency = selected_pose.get("mutation_local_consistency_score")
-                    if local_consistency is not None:
-                        st.metric(
-                            "Mut Local Consistency",
-                            f"{float(local_consistency):.3f}",
-                            help=(
-                                "Local agreement around mutated residues between compared structures. "
-                                "Higher values indicate more stable local geometry."
-                            ),
-                        )
-                        if selected_pose.get("mutation_local_consistency_label"):
-                            st.caption(f"Consistency label: {selected_pose['mutation_local_consistency_label']}")
-                
-                
                 # Individual PDB download
                 pdb_filepath = find_batch_boltz_structure_file(selected_pose['workspace'], selected_pose['design'], project_name)
                 if pdb_filepath and os.path.exists(pdb_filepath):
@@ -1177,7 +1085,7 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                     relaxed_exists = os.path.exists(relaxed_pdb)
                     relaxation_meta = _load_relaxation_metadata(relaxed_pdb) if relaxed_exists else None
 
-                    with st.expander("Optional Post-Prediction Relaxation", expanded=False):
+                    with st.expander("Post-prediction Relaxation.", expanded=False):
                         if check_openmm_available is None:
                             st.caption("OpenMM relaxation is unavailable in this environment.")
                         elif not check_openmm_available():
@@ -1205,39 +1113,24 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                                     help="Higher tolerance converges faster with less strict minimization.",
                                 )
 
+                            relax_input_pdb = relaxed_pdb if relaxed_exists else selected_pdb
                             if st.button(
-                                "Run Quick Relaxation",
+                                "Relax Model",
                                 key=f"run_relax_{selected_pose['workspace']}_{selected_pose['design']}",
                                 use_container_width=True,
+                                type="primary",
                             ):
-                                with st.spinner("Running quick relaxation (typically short)..."):
+                                with st.spinner("Running relaxation..."):
                                     relax_result = _run_quick_relaxation(
-                                        selected_pdb,
+                                        relax_input_pdb,
                                         max_iterations=relax_iterations,
                                         tolerance=relax_tolerance,
                                     )
                                 if relax_result.get("ok"):
-                                    st.success("Relaxed structure generated.")
-                                    relaxed_pdb = str(relax_result.get("path"))
-                                    relaxed_exists = os.path.exists(relaxed_pdb)
-                                    relaxation_meta = relax_result.get("metadata")
-                                else:
-                                    st.error(f"Relaxation failed: {relax_result.get('error', 'unknown_error')}")
-
-                            if st.button(
-                                "Minimize More",
-                                key=f"run_relax_more_{selected_pose['workspace']}_{selected_pose['design']}",
-                                use_container_width=True,
-                                disabled=not relaxed_exists,
-                            ):
-                                with st.spinner("Continuing relaxation..."):
-                                    relax_result = _run_quick_relaxation(
-                                        relaxed_pdb,
-                                        max_iterations=relax_iterations,
-                                        tolerance=relax_tolerance,
-                                    )
-                                if relax_result.get("ok"):
-                                    st.success("Relaxation updated.")
+                                    if relaxed_exists:
+                                        st.success("Relaxation updated.")
+                                    else:
+                                        st.success("Relaxed structure generated.")
                                     relaxed_pdb = str(relax_result.get("path"))
                                     relaxed_exists = os.path.exists(relaxed_pdb)
                                     relaxation_meta = relax_result.get("metadata")
@@ -1247,22 +1140,23 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                             if relaxed_exists:
                                 st.caption("Relaxed structure is available for viewing.")
                                 if relaxation_meta:
-                                    m1, m2, m3 = st.columns(3)
+                                    m1, m2 = st.columns(2)
                                     with m1:
-                                        delta_e = relaxation_meta.get("energy_change")
-                                        st.metric(
-                                            "Delta Energy",
-                                            "N/A" if delta_e is None else f"{float(delta_e):.2f}",
-                                        )
-                                    with m2:
                                         rmsd_val = relaxation_meta.get("rmsd")
                                         st.metric("RMSD", "N/A" if rmsd_val is None else f"{float(rmsd_val):.3f} A")
-                                    with m3:
+                                    with m2:
                                         clashes_removed = relaxation_meta.get("clashes_removed")
                                         st.metric("Clashes Removed", int(clashes_removed) if clashes_removed is not None else 0)
                                     runtime_sec = relaxation_meta.get("time_seconds")
-                                    if runtime_sec is not None:
-                                        st.caption(f"Last relaxation runtime: {float(runtime_sec):.1f}s")
+                                    delta_e = relaxation_meta.get("energy_change")
+                                    runtime_text = (
+                                        f"Last relaxation runtime: {float(runtime_sec):.1f}s"
+                                        if runtime_sec is not None
+                                        else "Last relaxation runtime: N/A"
+                                    )
+                                    if delta_e is not None:
+                                        runtime_text += f" | Delta Energy: {float(delta_e):.2f}"
+                                    st.caption(runtime_text)
                                 if st.button(
                                     "Delete Relaxed Structure",
                                     key=f"delete_relaxed_{selected_pose['workspace']}_{selected_pose['design']}",
@@ -1280,51 +1174,19 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                                     st.rerun()
                             else:
                                 st.caption("No relaxed structure generated yet.")
-
-                    mode_options = ["Original"]
-                    if relaxed_exists:
-                        mode_options.extend(["Relaxed", "Compare"])
-                    viewer_mode = st.radio(
-                        "Structure Version",
-                        options=mode_options,
-                        horizontal=True,
-                        key=f"viewer_mode_{selected_pose['workspace']}_{selected_pose['design']}",
-                    )
-                    displayed_pdb = relaxed_pdb if viewer_mode == "Relaxed" and relaxed_exists else selected_pdb
-                
-                # Download all PDBs functionality
-                if len(available_poses) > 1:
-                    # Create zip file in memory
-                    zip_buffer = io.BytesIO()
-                    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                        added_files = 0
-                        for pose in available_poses:
-                            pdb_path = find_batch_boltz_structure_file(pose['workspace'], pose['design'], project_name)
-                            if pdb_path and os.path.exists(pdb_path):
-                                # Create a descriptive filename
-                                safe_protein = "".join(c for c in pose['protein_name'] if c.isalnum() or c in (' ', '-', '_')).rstrip()
-                                safe_drug = "".join(c for c in pose['drug_name'] if c.isalnum() or c in (' ', '-', '_')).rstrip()
-                                zip_filename = f"{safe_protein}_{safe_drug}_pIC50_{pose['pic50']:.2f}.pdb"
-                                zip_file.write(pdb_path, zip_filename)
-                                added_files += 1
-                    
-                    if added_files > 0:
-                        zip_buffer.seek(0)
-                        zip_filename = f"{project_name}_all_pdbs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-                        st.download_button(
-                            label="Download All PDBs",
-                            data=zip_buffer.getvalue(),
-                            file_name=zip_filename,
-                            mime="application/zip",
-                            key="download_all_pdbs_zip",
-                            use_container_width=True
-                        )
-                    else:
-                        st.error("No PDB files found to download.")
         
         with right_col:
             # Display 3D structure
             if selected_pose:
+                mode_options = ["Original"]
+                if relaxed_exists:
+                    mode_options.extend(["Relaxed", "Compare"])
+                mode_key = f"viewer_mode_{selected_pose['workspace']}_{selected_pose['design']}"
+                viewer_mode = st.session_state.get(mode_key, "Original")
+                if viewer_mode not in mode_options:
+                    viewer_mode = "Original"
+                displayed_pdb = relaxed_pdb if viewer_mode == "Relaxed" and relaxed_exists else selected_pdb
+
                 with st.container(border=False):
                     if not selected_pdb or not os.path.exists(selected_pdb):
                         st.info("Selected pose has no available PDB for visualization.")
@@ -1350,6 +1212,40 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                             model_name=f"{selected_pose['workspace']}_{selected_pose['design']}",
                             height=600,
                         )
+
+                controls_left, controls_right = st.columns([2, 1])
+                with controls_left:
+                    st.radio(
+                        "Structure Version",
+                        options=mode_options,
+                        horizontal=True,
+                        key=mode_key,
+                    )
+                with controls_right:
+                    if len(available_poses) > 1:
+                        zip_buffer = io.BytesIO()
+                        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                            added_files = 0
+                            for pose in available_poses:
+                                pdb_path = find_batch_boltz_structure_file(pose['workspace'], pose['design'], project_name)
+                                if pdb_path and os.path.exists(pdb_path):
+                                    safe_protein = "".join(c for c in pose['protein_name'] if c.isalnum() or c in (' ', '-', '_')).rstrip()
+                                    safe_drug = "".join(c for c in pose['drug_name'] if c.isalnum() or c in (' ', '-', '_')).rstrip()
+                                    zip_filename = f"{safe_protein}_{safe_drug}_pIC50_{pose['pic50']:.2f}.pdb"
+                                    zip_file.write(pdb_path, zip_filename)
+                                    added_files += 1
+
+                        if added_files > 0:
+                            zip_buffer.seek(0)
+                            zip_filename = f"{project_name}_all_pdbs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+                            st.download_button(
+                                label="Download All PDBs",
+                                data=zip_buffer.getvalue(),
+                                file_name=zip_filename,
+                                mime="application/zip",
+                                key="download_all_pdbs_zip",
+                                use_container_width=True,
+                            )
             else:
                 st.info("Select a pose from the dropdown to view the 3D structure.")
 
