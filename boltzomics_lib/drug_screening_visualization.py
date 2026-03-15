@@ -307,6 +307,14 @@ def display_screening_3d_structure_from_path(
     view.addModel(pdb_data, name=model_name)
     view.setColorMode('element')
     view.removeSolvent(True)
+    # Best-effort camera normalization so relaxed models open centered in-frame.
+    for method_name in ("center", "zoomTo", "fitToModel"):
+        method = getattr(view, method_name, None)
+        if callable(method):
+            try:
+                method()
+            except Exception:
+                pass
 
     # Get the HTML content and wrap it in a responsive container
     html_content = view._repr_html_()
@@ -1000,6 +1008,8 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
         with left_col:      
             # Create dropdown options
             pose_options = []
+            original_pdb_download_data = None
+            original_pdb_download_name = None
             for pose in available_poses:
                 display_name = f"{pose['protein_name']} + {pose['drug_name']} (pIC50: {pose['pic50']:.2f}, Confidence: {pose['confidence']:.3f})"
                 pose_options.append((display_name, pose))
@@ -1061,13 +1071,8 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdb"
                     )
                     with open(selected_pdb, "rb") as f:
-                        st.download_button(
-                            label="Download Original PDB",
-                            data=f.read(),
-                            file_name=file_name_orig,
-                            key=f"download_original_pdb_{hash(selected_pdb)}",
-                            use_container_width=True,
-                        )
+                        original_pdb_download_data = f.read()
+                    original_pdb_download_name = file_name_orig
                     if relaxed_exists:
                         file_name_relaxed = (
                             f"{selected_pose['protein_name']}_{selected_pose['drug_name']}_relaxed_"
@@ -1091,7 +1096,8 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                     relaxed_exists = os.path.exists(relaxed_pdb)
                     relaxation_meta = _load_relaxation_metadata(relaxed_pdb) if relaxed_exists else None
 
-                    with st.expander("Post-prediction Relaxation.", expanded=False):
+                    with st.container(border=False):
+                        st.markdown("**Post-prediction Relaxation**")
                         if check_openmm_available is None:
                             st.caption("OpenMM relaxation is unavailable in this environment.")
                         elif not check_openmm_available():
@@ -1120,64 +1126,64 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                                 )
 
                             relax_input_pdb = relaxed_pdb if relaxed_exists else selected_pdb
-                            if st.button(
-                                "Relax Model",
-                                key=f"run_relax_{selected_pose['workspace']}_{selected_pose['design']}",
-                                use_container_width=True,
-                                type="tertiary",
-                            ):
-                                with st.spinner("Running relaxation..."):
-                                    relax_result = _run_quick_relaxation(
-                                        relax_input_pdb,
-                                        max_iterations=relax_iterations,
-                                        tolerance=relax_tolerance,
-                                    )
-                                if relax_result.get("ok"):
-                                    if relaxed_exists:
-                                        st.success("Relaxation updated.")
+                            btn_col1, btn_col2 = st.columns(2)
+                            with btn_col1:
+                                if st.button(
+                                    "Relax Model",
+                                    key=f"run_relax_{selected_pose['workspace']}_{selected_pose['design']}",
+                                    use_container_width=True,
+                                    type="tertiary",
+                                ):
+                                    with st.spinner("Running relaxation..."):
+                                        relax_result = _run_quick_relaxation(
+                                            relax_input_pdb,
+                                            max_iterations=relax_iterations,
+                                            tolerance=relax_tolerance,
+                                        )
+                                    if relax_result.get("ok"):
+                                        relaxed_pdb = str(relax_result.get("path"))
+                                        relaxed_exists = os.path.exists(relaxed_pdb)
+                                        relaxation_meta = relax_result.get("metadata")
                                     else:
-                                        st.success("Relaxed structure generated.")
-                                    relaxed_pdb = str(relax_result.get("path"))
-                                    relaxed_exists = os.path.exists(relaxed_pdb)
-                                    relaxation_meta = relax_result.get("metadata")
-                                else:
-                                    st.error(f"Relaxation failed: {relax_result.get('error', 'unknown_error')}")
+                                        st.error(f"Relaxation failed: {relax_result.get('error', 'unknown_error')}")
+                            with btn_col2:
+                                if relaxed_exists:
+                                    if st.button(
+                                        "Delete Relaxed Model",
+                                        key=f"delete_relaxed_{selected_pose['workspace']}_{selected_pose['design']}",
+                                        use_container_width=True,
+                                        type="tertiary",
+                                    ):
+                                        try:
+                                            os.remove(relaxed_pdb)
+                                        except Exception:
+                                            pass
+                                        try:
+                                            os.remove(_get_relaxation_metadata_path(relaxed_pdb))
+                                        except Exception:
+                                            pass
+                                        st.success("Relaxed model deleted.")
+                                        st.rerun()
 
                             if relaxed_exists:
-                                st.caption("Relaxed structure is available for viewing.")
                                 if relaxation_meta:
                                     m1, m2 = st.columns(2)
                                     with m1:
                                         rmsd_val = relaxation_meta.get("rmsd")
-                                        st.metric("RMSD", "N/A" if rmsd_val is None else f"{float(rmsd_val):.3f} A")
+                                        st.metric(
+                                            "RMSD",
+                                            "N/A" if rmsd_val is None else f"{float(rmsd_val):.3f} A",
+                                            help="Root-mean-square displacement (in Angstrom) between atom coordinates before vs after OpenMM relaxation for this same model. Lower means less structural movement.",
+                                        )
                                     with m2:
                                         clashes_removed = relaxation_meta.get("clashes_removed")
-                                        st.metric("Clashes Removed", int(clashes_removed) if clashes_removed is not None else 0)
-                                    runtime_sec = relaxation_meta.get("time_seconds")
-                                    runtime_text = (
-                                        f"Last relaxation runtime: {float(runtime_sec):.1f}s"
-                                        if runtime_sec is not None
-                                        else "Last relaxation runtime: N/A"
-                                    )
-                                    st.caption(runtime_text)
-                                if st.button(
-                                    "Delete Relaxed Structure",
-                                    key=f"delete_relaxed_{selected_pose['workspace']}_{selected_pose['design']}",
-                                    use_container_width=True,
-                                    type="tertiary",
-                                ):
-                                    try:
-                                        os.remove(relaxed_pdb)
-                                    except Exception:
-                                        pass
-                                    try:
-                                        os.remove(_get_relaxation_metadata_path(relaxed_pdb))
-                                    except Exception:
-                                        pass
-                                    st.success("Relaxed structure deleted.")
-                                    st.rerun()
+                                        st.metric(
+                                            "Clashes Removed",
+                                            int(clashes_removed) if clashes_removed is not None else 0,
+                                            help="Reduction in clash-severity score after relaxation (initial minus final). Higher means relaxation resolved more close-contact strain.",
+                                        )
                             else:
-                                st.caption("No relaxed structure generated yet.")
+                                st.caption("No relaxed model generated yet.")
         
         with right_col:
             # Display 3D structure
@@ -1225,7 +1231,7 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                             height=600,
                         )
 
-                controls_left, controls_right = st.columns([2, 1])
+                controls_left, controls_mid, controls_right = st.columns([2, 1, 1])
                 with controls_left:
                     st.radio(
                         "Structure Version",
@@ -1233,6 +1239,15 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                         horizontal=True,
                         key=mode_key,
                     )
+                with controls_mid:
+                    if original_pdb_download_data is not None and original_pdb_download_name is not None:
+                        st.download_button(
+                            label="Download Original PDB",
+                            data=original_pdb_download_data,
+                            file_name=original_pdb_download_name,
+                            key=f"download_original_pdb_{hash(selected_pdb)}",
+                            use_container_width=True,
+                        )
                 with controls_right:
                     if len(available_poses) > 1:
                         zip_buffer = io.BytesIO()
@@ -1405,7 +1420,10 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                                         "+ 0.3*(1 - fingerprint similarity), with 1.5x boost if mutation is at interface. "
                                         "Lower is better; near 0 means WT-like interface.",
                                     )
-                                    st.caption("Weighted contact-change + clash + fingerprint shift score (0-1). Lower is better.")
+                                    st.caption(
+                                        "For each mutation position, we measure contact changes, add a capped new-clash penalty, "
+                                        "and add interaction-pattern change (1 - similarity), then average across positions. Lower is better."
+                                    )
                                 with d2:
                                     st.metric(
                                         "Mean Fingerprint Similarity",
@@ -1414,7 +1432,10 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                                         "Fingerprint encodes residue-contact and interaction-type bits. "
                                         "Higher is better; 1.0 means identical fingerprint.",
                                     )
-                                    st.caption("Mean Tanimoto similarity of WT-vs-mutant interaction fingerprints. Higher is better.")
+                                    st.caption(
+                                        "At each mutation position, we build WT and mutant interaction fingerprints, "
+                                        "compute Tanimoto similarity, then average those similarities. Higher is better."
+                                    )
                                 with d3:
                                     st.metric(
                                         "Total New Clashes",
@@ -1422,7 +1443,10 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                                         help="Sum of clash events present in mutant but absent in WT across evaluated mutation positions. "
                                         "Lower is better; 0 is ideal.",
                                     )
-                                    st.caption("New steric overlaps introduced in mutant vs WT; lower is better.")
+                                    st.caption(
+                                        "For each mutation position, we count clashes present in mutant but not in WT, "
+                                        "then sum those counts. Lower is better."
+                                    )
                             else:
                                 st.caption("WT-vs-mutant interaction comparison could not be computed for detected mutation positions.")
     else:
@@ -1630,13 +1654,120 @@ def display_structure_only_3d_viewer(results, project_name):
                     icon=":material/download:",
                     use_container_width=True
                 )
+            selected_pdb = pdb_filepath
+            relaxed_pdb = _get_relaxed_structure_path(selected_pdb)
+            relaxed_exists = os.path.exists(relaxed_pdb)
+            relaxation_meta = _load_relaxation_metadata(relaxed_pdb) if relaxed_exists else None
+
+            with st.container(border=False):
+                st.markdown("**Post-prediction Relaxation**")
+                if check_openmm_available is None:
+                    st.caption("OpenMM relaxation is unavailable in this environment.")
+                elif not check_openmm_available():
+                    st.caption("OpenMM is not installed. Install it to enable relaxation.")
+                else:
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        relax_iterations = st.slider(
+                            "Quick Relax Iterations",
+                            min_value=50,
+                            max_value=500,
+                            value=150,
+                            step=25,
+                            key=f"so_relax_iter_{selected_pose['workspace']}_{selected_pose['design']}",
+                            help="Lower values complete faster. 150 is a quick interactive default.",
+                        )
+                    with c2:
+                        relax_tolerance = st.slider(
+                            "Tolerance (kJ/mol/nm)",
+                            min_value=5.0,
+                            max_value=50.0,
+                            value=20.0,
+                            step=1.0,
+                            key=f"so_relax_tol_{selected_pose['workspace']}_{selected_pose['design']}",
+                            help="Higher tolerance converges faster with less strict minimization.",
+                        )
+
+                    relax_input_pdb = relaxed_pdb if relaxed_exists else selected_pdb
+                    btn_col1, btn_col2 = st.columns(2)
+                    with btn_col1:
+                        if st.button(
+                            "Relax Model",
+                            key=f"so_run_relax_{selected_pose['workspace']}_{selected_pose['design']}",
+                            use_container_width=True,
+                            type="tertiary",
+                        ):
+                            with st.spinner("Running relaxation..."):
+                                relax_result = _run_quick_relaxation(
+                                    relax_input_pdb,
+                                    max_iterations=relax_iterations,
+                                    tolerance=relax_tolerance,
+                                )
+                            if relax_result.get("ok"):
+                                if relaxed_exists:
+                                    st.success("Relaxed model updated.")
+                                relaxed_pdb = str(relax_result.get("path"))
+                                relaxed_exists = os.path.exists(relaxed_pdb)
+                                relaxation_meta = relax_result.get("metadata")
+                            else:
+                                st.error(f"Relaxation failed: {relax_result.get('error', 'unknown_error')}")
+                    with btn_col2:
+                        if relaxed_exists:
+                            if st.button(
+                                "Delete Relaxed Model",
+                                key=f"so_delete_relaxed_{selected_pose['workspace']}_{selected_pose['design']}",
+                                use_container_width=True,
+                                type="tertiary",
+                            ):
+                                try:
+                                    os.remove(relaxed_pdb)
+                                except Exception:
+                                    pass
+                                try:
+                                    os.remove(_get_relaxation_metadata_path(relaxed_pdb))
+                                except Exception:
+                                    pass
+                                st.success("Relaxed model deleted.")
+                                st.rerun()
+
+                    if relaxed_exists:
+                        if relaxation_meta:
+                            m1, m2 = st.columns(2)
+                            with m1:
+                                rmsd_val = relaxation_meta.get("rmsd")
+                                st.metric(
+                                    "RMSD",
+                                    "N/A" if rmsd_val is None else f"{float(rmsd_val):.3f} A",
+                                    help="Root-mean-square displacement (in Angstrom) between atom coordinates before vs after OpenMM relaxation for this same model. Lower means less structural movement.",
+                                )
+                            with m2:
+                                clashes_removed = relaxation_meta.get("clashes_removed")
+                                st.metric(
+                                    "Clashes Removed",
+                                    int(clashes_removed) if clashes_removed is not None else 0,
+                                    help="Reduction in clash-severity score after relaxation (initial minus final). Higher means relaxation resolved more close-contact strain.",
+                                )
+                    else:
+                        st.caption("No relaxed model generated yet.")
+
+            mode_options = ["Original"]
+            if relaxed_exists:
+                mode_options.append("Relaxed")
+            mode_key = f"so_viewer_mode_{selected_pose['workspace']}_{selected_pose['design']}"
+            st.radio(
+                "Structure Version",
+                options=mode_options,
+                horizontal=True,
+                key=mode_key,
+            )
+            viewer_mode = st.session_state.get(mode_key, "Original")
+            displayed_pdb = relaxed_pdb if viewer_mode == "Relaxed" and relaxed_exists else selected_pdb
         # 3D structure viewer
         with st.container(border=False):
-            display_screening_3d_structure(
-                selected_pose['workspace'],
-                selected_pose['design'],
-                project_name,
-                height=900
+            display_screening_3d_structure_from_path(
+                pdb_path=displayed_pdb if (pdb_filepath and os.path.exists(pdb_filepath)) else pdb_filepath,
+                model_name=f"{selected_pose['workspace']}_{selected_pose['design']}",
+                height=900,
             )
     # Download all PDBs as zip
     if len(available_poses) > 1:

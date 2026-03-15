@@ -16,11 +16,13 @@ Author: BoltzOmics Team
 """
 
 import os
+import errno
 import json
 import logging
 import tempfile
 import re
 import math
+import shutil
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
@@ -184,7 +186,7 @@ def minimize_structure_openmm(
         if output_path is None:
             base = os.path.splitext(pdb_path)[0]
             output_path = f"{base}_minimized.pdb"
-        output_path = str(output_path)
+        output_path = os.path.abspath(str(output_path))
 
         if not os.path.exists(pdb_path):
             raise FileNotFoundError(f"PDB not found: {pdb_path}")
@@ -442,7 +444,43 @@ def minimize_structure_openmm(
                 PDBFile.writeFile(modeller.topology, final_positions, f)
 
         if inplace_update and write_path != output_path:
-            os.replace(write_path, output_path)
+            write_path = os.path.abspath(write_path)
+            try:
+                os.replace(write_path, output_path)
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
+                    raise
+                # Cross-device fallback: copy into target dir, then install at destination.
+                target_dir = os.path.dirname(output_path) or "."
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    prefix=".tmp_minimized_copy_",
+                    suffix=".pdb",
+                    dir=target_dir,
+                    delete=False,
+                ) as tmp_copy:
+                    copy_path = os.path.abspath(tmp_copy.name)
+                try:
+                    shutil.copy2(write_path, copy_path)
+                    try:
+                        os.replace(copy_path, output_path)
+                    except OSError as exc2:
+                        if exc2.errno != errno.EXDEV:
+                            raise
+                        # Last-resort fallback if even temp->destination rename is cross-device.
+                        shutil.copy2(copy_path, output_path)
+                        os.remove(copy_path)
+                finally:
+                    try:
+                        if os.path.exists(copy_path):
+                            os.remove(copy_path)
+                    except Exception:
+                        pass
+                    try:
+                        if os.path.exists(write_path):
+                            os.remove(write_path)
+                    except Exception:
+                        pass
 
         return RefinementResult(
             original_pdb_path=pdb_path,
@@ -571,10 +609,17 @@ def _write_minimized_coords_preserve_original_records(
             dst.write(line)
 
 
-def _count_clashes(positions: np.ndarray, topology, clash_threshold: float = 0.4) -> int:
-    """Count atomic clashes (distances below threshold in nm)."""
+def _count_clashes(positions: np.ndarray, topology, clash_threshold: float = 0.35) -> int:
+    """
+    Compute a clash-severity score (integer) from close atomic pairs.
+
+    Each pair below `clash_threshold` contributes a weighted overlap term:
+    (clash_threshold - distance) / clash_threshold.
+    This is more sensitive than a hard count and better captures small
+    post-minimization geometry improvements.
+    """
     n_atoms = len(positions)
-    clash_count = 0
+    clash_severity = 0.0
 
     # Get positions as numpy array
     if hasattr(positions, 'value_in_unit'):
@@ -588,9 +633,10 @@ def _count_clashes(positions: np.ndarray, topology, clash_threshold: float = 0.4
         for j in range(i + 4, min(n_atoms, 1000)):  # Skip bonded atoms
             dist = np.linalg.norm(pos[i] - pos[j])
             if dist < clash_threshold:
-                clash_count += 1
+                overlap = (float(clash_threshold) - float(dist)) / float(clash_threshold)
+                clash_severity += max(0.0, overlap)
 
-    return clash_count
+    return int(round(clash_severity))
 
 
 def _extract_ligand_positions_from_pdb(pdb_path: str, ligand_resname: str = "LIG") -> Optional[np.ndarray]:
@@ -719,12 +765,11 @@ def analyze_binding_interface(
             contact_score=0.0
         )
 
-    # Find all contacts
-    contacts = []
-    clashes = []
-    hydrogen_bonds = []
-    hydrophobic_contacts = []
-    contact_residues = set()
+    # Find all contacts at residue level (deduplicate atom-level multiplicity).
+    contacts_by_residue: Dict[str, AtomContact] = {}
+    clashes_by_residue: Dict[str, AtomContact] = {}
+    hbonds_by_residue: Dict[str, AtomContact] = {}
+    hydrophobic_by_residue: Dict[str, AtomContact] = {}
 
     # H-bond donors/acceptors
     hbond_atoms = {'N', 'O', 'NE', 'NE1', 'NE2', 'ND1', 'ND2', 'NZ', 'OG', 'OG1', 'OH', 'OD1', 'OD2', 'OE1', 'OE2'}
@@ -736,7 +781,16 @@ def analyze_binding_interface(
 
             if dist < contact_threshold:
                 residue_id = f"{p_atom['resname']}{p_atom['resid']}"
-                contact_residues.add(residue_id)
+                base_contact = AtomContact(
+                    protein_residue=residue_id,
+                    protein_atom=p_atom['name'],
+                    ligand_atom=l_atom['name'],
+                    distance=dist,
+                    interaction_type=InteractionType.HYDROPHOBIC,  # default generic contact type
+                )
+                prev_contact = contacts_by_residue.get(residue_id)
+                if (prev_contact is None) or (float(dist) < float(prev_contact.distance)):
+                    contacts_by_residue[residue_id] = base_contact
 
                 # Determine interaction type
                 if dist < clash_threshold:
@@ -748,8 +802,9 @@ def analyze_binding_interface(
                         distance=dist,
                         interaction_type=interaction_type
                     )
-                    clashes.append(contact)
-                    contacts.append(contact)
+                    prev = clashes_by_residue.get(residue_id)
+                    if (prev is None) or (float(dist) < float(prev.distance)):
+                        clashes_by_residue[residue_id] = contact
 
                 elif p_atom['name'] in hbond_atoms and dist < hbond_threshold:
                     interaction_type = InteractionType.HYDROGEN_BOND
@@ -760,8 +815,9 @@ def analyze_binding_interface(
                         distance=dist,
                         interaction_type=interaction_type
                     )
-                    hydrogen_bonds.append(contact)
-                    contacts.append(contact)
+                    prev = hbonds_by_residue.get(residue_id)
+                    if (prev is None) or (float(dist) < float(prev.distance)):
+                        hbonds_by_residue[residue_id] = contact
 
                 elif p_atom['name'] in hydrophobic_atoms:
                     interaction_type = InteractionType.HYDROPHOBIC
@@ -772,18 +828,15 @@ def analyze_binding_interface(
                         distance=dist,
                         interaction_type=interaction_type
                     )
-                    hydrophobic_contacts.append(contact)
-                    contacts.append(contact)
+                    prev = hydrophobic_by_residue.get(residue_id)
+                    if (prev is None) or (float(dist) < float(prev.distance)):
+                        hydrophobic_by_residue[residue_id] = contact
 
-                else:
-                    contact = AtomContact(
-                        protein_residue=residue_id,
-                        protein_atom=p_atom['name'],
-                        ligand_atom=l_atom['name'],
-                        distance=dist,
-                        interaction_type=InteractionType.HYDROPHOBIC  # Default
-                    )
-                    contacts.append(contact)
+    contacts = list(contacts_by_residue.values())
+    clashes = list(clashes_by_residue.values())
+    hydrogen_bonds = list(hbonds_by_residue.values())
+    hydrophobic_contacts = list(hydrophobic_by_residue.values())
+    contact_residues = set(contacts_by_residue.keys())
 
     # Estimate buried surface area (simplified)
     bsa = len(contact_residues) * 120.0  # ~120 A^2 per contacting residue (rough estimate)
@@ -1318,6 +1371,19 @@ def quick_interface_check(pdb_path: str, auto_detect_chains: bool = True) -> Dic
             )
         return rows
 
+    def _dedupe_by_residue(items: List[AtomContact]) -> List[AtomContact]:
+        by_residue: Dict[str, AtomContact] = {}
+        for c in items:
+            key = str(c.protein_residue)
+            prev = by_residue.get(key)
+            if prev is None or float(c.distance) < float(prev.distance):
+                by_residue[key] = c
+        return list(by_residue.values())
+
+    combined_contacts = _dedupe_by_residue(
+        analysis.hydrogen_bonds + analysis.hydrophobic_contacts + analysis.clashes
+    )
+
     return {
         "contacts": analysis.total_contacts,
         "clashes": len(analysis.clashes),
@@ -1325,9 +1391,7 @@ def quick_interface_check(pdb_path: str, auto_detect_chains: bool = True) -> Dic
         "h_bonds": len(analysis.hydrogen_bonds),
         "hydrophobic": len(analysis.hydrophobic_contacts),
         "contact_residues": analysis.contact_residues,
-        "contacts_rows": _serialize_contacts(
-            analysis.hydrogen_bonds + analysis.hydrophobic_contacts + analysis.clashes
-        ),
+        "contacts_rows": _serialize_contacts(combined_contacts),
         "hbond_rows": _serialize_contacts(analysis.hydrogen_bonds),
         "hydrophobic_rows": _serialize_contacts(analysis.hydrophobic_contacts),
         "clash_rows": _serialize_contacts(analysis.clashes),
