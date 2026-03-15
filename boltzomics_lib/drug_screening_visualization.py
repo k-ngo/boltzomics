@@ -268,6 +268,7 @@ def display_screening_3d_structure_from_path(
     model_name: str,
     height: int = 600,
     width: int = 600,
+    show_panel: bool = True,
 ) -> None:
     """
     Render a 3D structure from an explicit PDB path using molview.
@@ -302,7 +303,7 @@ def display_screening_3d_structure_from_path(
 
     # Create molview viewer with dynamic width
     # The width will be overridden by CSS to be responsive
-    view = mv.view(width=800, height=height, panel=True)
+    view = mv.view(width=800, height=height, panel=bool(show_panel))
     view.addModel(pdb_data, name=model_name)
     view.setColorMode('element')
     view.removeSolvent(True)
@@ -1018,7 +1019,14 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
             
             if selected_pose:
                 if not structure_only:
-                    st.caption(f"Protein: {selected_pose['protein_name']} | Drug: {selected_pose['drug_name']}")
+                    st.markdown(
+                        (
+                            "<p style='font-size:1.05rem; font-weight:600; margin:0 0 0.4rem 0;'>"
+                            f"Protein: {selected_pose['protein_name']} | Drug: {selected_pose['drug_name']}"
+                            "</p>"
+                        ),
+                        unsafe_allow_html=True,
+                    )
                     col1, col2, col3 = st.columns(3)
                     with col1:
                         if selected_pose.get("pic50") is not None:
@@ -1073,8 +1081,6 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                                 key=f"download_relaxed_pdb_{hash(relaxed_pdb)}",
                                 use_container_width=True,
                             )
-                    else:
-                        st.caption("Relaxed PDB not available yet.")
                 else:
                     st.info("PDB file not found for download.")
 
@@ -1118,7 +1124,7 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                                 "Relax Model",
                                 key=f"run_relax_{selected_pose['workspace']}_{selected_pose['design']}",
                                 use_container_width=True,
-                                type="primary",
+                                type="tertiary",
                             ):
                                 with st.spinner("Running relaxation..."):
                                     relax_result = _run_quick_relaxation(
@@ -1148,19 +1154,17 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                                         clashes_removed = relaxation_meta.get("clashes_removed")
                                         st.metric("Clashes Removed", int(clashes_removed) if clashes_removed is not None else 0)
                                     runtime_sec = relaxation_meta.get("time_seconds")
-                                    delta_e = relaxation_meta.get("energy_change")
                                     runtime_text = (
                                         f"Last relaxation runtime: {float(runtime_sec):.1f}s"
                                         if runtime_sec is not None
                                         else "Last relaxation runtime: N/A"
                                     )
-                                    if delta_e is not None:
-                                        runtime_text += f" | Delta Energy: {float(delta_e):.2f}"
                                     st.caption(runtime_text)
                                 if st.button(
                                     "Delete Relaxed Structure",
                                     key=f"delete_relaxed_{selected_pose['workspace']}_{selected_pose['design']}",
                                     use_container_width=True,
+                                    type="tertiary",
                                 ):
                                     try:
                                         os.remove(relaxed_pdb)
@@ -1193,18 +1197,26 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                     elif viewer_mode == "Compare" and relaxed_pdb and os.path.exists(relaxed_pdb):
                         c1, c2 = st.columns(2)
                         with c1:
-                            st.caption("Original")
+                            st.markdown(
+                                "<p style='text-align:center; margin:0 0 0.25rem 0; font-weight:600;'>Original</p>",
+                                unsafe_allow_html=True,
+                            )
                             display_screening_3d_structure_from_path(
                                 pdb_path=selected_pdb,
                                 model_name=f"{selected_pose['workspace']}_{selected_pose['design']}_original",
                                 height=560,
+                                show_panel=False,
                             )
                         with c2:
-                            st.caption("Relaxed")
+                            st.markdown(
+                                "<p style='text-align:center; margin:0 0 0.25rem 0; font-weight:600;'>Relaxed</p>",
+                                unsafe_allow_html=True,
+                            )
                             display_screening_3d_structure_from_path(
                                 pdb_path=relaxed_pdb,
                                 model_name=f"{selected_pose['workspace']}_{selected_pose['design']}_relaxed",
                                 height=560,
+                                show_panel=False,
                             )
                     else:
                         display_screening_3d_structure_from_path(
@@ -1276,14 +1288,65 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                     m1, m2, m3, m4, m5 = st.columns(5)
                     with m1:
                         st.metric("Contacts", int(base_interface.get("contacts", 0)))
+                        st.caption("Protein-ligand residue contacts within interface cutoff.")
                     with m2:
                         st.metric("H-Bonds", int(base_interface.get("h_bonds", 0)))
+                        st.caption("Hydrogen-bond count from interface contact detection.")
                     with m3:
                         st.metric("Hydrophobic", int(base_interface.get("hydrophobic", 0)))
+                        st.caption("Hydrophobic contact count at the interface.")
                     with m4:
                         st.metric("Clashes", int(base_interface.get("clashes", 0)))
+                        st.caption("Steric overlaps detected at the interface (lower is better).")
                     with m5:
-                        st.metric("Interface Quality", str(base_interface.get("quality", "N/A")))
+                        clash_score = base_interface.get("clash_score", None)
+                        st.metric(
+                            "Clash Score",
+                            "N/A" if clash_score is None else f"{float(clash_score):.3f}",
+                            help="Normalized steric-overlap burden at the interface. Lower is better; values near 0 indicate cleaner geometry.",
+                        )
+                        st.caption("Normalized steric-overlap burden at the interface. Lower is better.")
+
+                    # Contribution tables for transparency (reviewer-safe, quantitative).
+                    with st.expander("Contacts contributors", expanded=False):
+                        rows = base_interface.get("contacts_rows", []) or []
+                        if rows:
+                            contact_df = pd.DataFrame(rows)
+                            if "distance_A" in contact_df.columns:
+                                contact_df["distance_A"] = pd.to_numeric(contact_df["distance_A"], errors="coerce").round(3)
+                            st.dataframe(contact_df, use_container_width=True, hide_index=True)
+                        else:
+                            st.caption("No contact contributors detected.")
+
+                    with st.expander("H-Bonds contributors", expanded=False):
+                        rows = base_interface.get("hbond_rows", []) or []
+                        if rows:
+                            hbond_df = pd.DataFrame(rows)
+                            if "distance_A" in hbond_df.columns:
+                                hbond_df["distance_A"] = pd.to_numeric(hbond_df["distance_A"], errors="coerce").round(3)
+                            st.dataframe(hbond_df, use_container_width=True, hide_index=True)
+                        else:
+                            st.caption("No hydrogen-bond contributors detected.")
+
+                    with st.expander("Hydrophobic contributors", expanded=False):
+                        rows = base_interface.get("hydrophobic_rows", []) or []
+                        if rows:
+                            hydro_df = pd.DataFrame(rows)
+                            if "distance_A" in hydro_df.columns:
+                                hydro_df["distance_A"] = pd.to_numeric(hydro_df["distance_A"], errors="coerce").round(3)
+                            st.dataframe(hydro_df, use_container_width=True, hide_index=True)
+                        else:
+                            st.caption("No hydrophobic contributors detected.")
+
+                    with st.expander("Clash contributors", expanded=False):
+                        rows = base_interface.get("clash_rows", []) or []
+                        if rows:
+                            clash_df = pd.DataFrame(rows)
+                            if "distance_A" in clash_df.columns:
+                                clash_df["distance_A"] = pd.to_numeric(clash_df["distance_A"], errors="coerce").round(3)
+                            st.dataframe(clash_df, use_container_width=True, hide_index=True)
+                        else:
+                            st.caption("No clash contributors detected.")
 
                 # WT vs mutant interaction comparison for selected drug.
                 if compare_wt_mutant_quick is None:
@@ -1312,9 +1375,6 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                         if not wt_pdb or not os.path.exists(wt_pdb):
                             st.caption("WT structure file not found for interaction comparison.")
                         else:
-                            per_pos_rows = []
-                            lost_union = set()
-                            gained_union = set()
                             total_new_clashes = 0
                             disruptions = []
                             similarities = []
@@ -1333,47 +1393,36 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                                 disruptions.append(float(comp.get("disruption_score", 0.0)))
                                 similarities.append(float(comp.get("fingerprint_similarity", 0.0)))
                                 total_new_clashes += int(comp.get("new_clashes", 0))
-                                for item in comp.get("lost_contacts", []) or []:
-                                    lost_union.add(str(item))
-                                for item in comp.get("gained_contacts", []) or []:
-                                    gained_union.add(str(item))
-                                per_pos_rows.append(
-                                    {
-                                        "Mutation Position": int(pos),
-                                        "Impact": str(comp.get("impact", "N/A")),
-                                        "Disruption Score": float(comp.get("disruption_score", 0.0)),
-                                        "Fingerprint Similarity": float(comp.get("fingerprint_similarity", 0.0)),
-                                        "New Clashes": int(comp.get("new_clashes", 0)),
-                                    }
-                                )
-
-                            if per_pos_rows:
+                            if disruptions:
                                 st.markdown("**WT vs Mutant Interaction Delta (same drug)**")
                                 d1, d2, d3 = st.columns(3)
                                 with d1:
                                     st.metric(
                                         "Mean Disruption",
                                         f"{(sum(disruptions) / len(disruptions)):.3f}",
-                                        help="Higher means larger interaction-profile shift from WT.",
+                                        help="Computed as the mean of per-mutation disruption scores. "
+                                        "Per-mutation score = 0.3*(contact-change fraction) + 0.4*(new-clash penalty, capped at 3 clashes) "
+                                        "+ 0.3*(1 - fingerprint similarity), with 1.5x boost if mutation is at interface. "
+                                        "Lower is better; near 0 means WT-like interface.",
                                     )
+                                    st.caption("Weighted contact-change + clash + fingerprint shift score (0-1). Lower is better.")
                                 with d2:
                                     st.metric(
                                         "Mean Fingerprint Similarity",
                                         f"{(sum(similarities) / len(similarities)):.3f}",
-                                        help="Higher means mutant interactions are more WT-like.",
+                                        help="Mean Tanimoto similarity between WT and mutant interaction fingerprints across mutation positions. "
+                                        "Fingerprint encodes residue-contact and interaction-type bits. "
+                                        "Higher is better; 1.0 means identical fingerprint.",
                                     )
+                                    st.caption("Mean Tanimoto similarity of WT-vs-mutant interaction fingerprints. Higher is better.")
                                 with d3:
                                     st.metric(
                                         "Total New Clashes",
                                         int(total_new_clashes),
-                                        help="Total newly introduced steric clashes across mutation positions.",
+                                        help="Sum of clash events present in mutant but absent in WT across evaluated mutation positions. "
+                                        "Lower is better; 0 is ideal.",
                                     )
-                                st.dataframe(pd.DataFrame(per_pos_rows), use_container_width=True, hide_index=True)
-
-                                if lost_union:
-                                    st.caption("Lost contact residues: " + ", ".join(sorted(lost_union)))
-                                if gained_union:
-                                    st.caption("Gained contact residues: " + ", ".join(sorted(gained_union)))
+                                    st.caption("New steric overlaps introduced in mutant vs WT; lower is better.")
                             else:
                                 st.caption("WT-vs-mutant interaction comparison could not be computed for detected mutation positions.")
     else:

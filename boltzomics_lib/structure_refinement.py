@@ -1304,21 +1304,33 @@ def quick_interface_check(pdb_path: str, auto_detect_chains: bool = True) -> Dic
 
     analysis = analyze_binding_interface(pdb_path, ligand_chain, protein_chain)
 
-    quality = "GOOD"
-    if analysis.clash_score > 0.2:
-        quality = "POOR - has clashes"
-    elif analysis.total_contacts < 5:
-        quality = "WEAK - few contacts"
-    elif len(analysis.hydrogen_bonds) == 0:
-        quality = "MODERATE - no H-bonds"
+    def _serialize_contacts(items: List[AtomContact]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for c in items:
+            rows.append(
+                {
+                    "protein_residue": str(c.protein_residue),
+                    "protein_atom": str(c.protein_atom),
+                    "ligand_atom": str(c.ligand_atom),
+                    "distance_A": float(c.distance),
+                    "interaction_type": str(c.interaction_type.value),
+                }
+            )
+        return rows
 
     return {
-        "quality": quality,
         "contacts": analysis.total_contacts,
         "clashes": len(analysis.clashes),
+        "clash_score": float(analysis.clash_score),
         "h_bonds": len(analysis.hydrogen_bonds),
         "hydrophobic": len(analysis.hydrophobic_contacts),
-        "contact_residues": analysis.contact_residues
+        "contact_residues": analysis.contact_residues,
+        "contacts_rows": _serialize_contacts(
+            analysis.hydrogen_bonds + analysis.hydrophobic_contacts + analysis.clashes
+        ),
+        "hbond_rows": _serialize_contacts(analysis.hydrogen_bonds),
+        "hydrophobic_rows": _serialize_contacts(analysis.hydrophobic_contacts),
+        "clash_rows": _serialize_contacts(analysis.clashes),
     }
 
 

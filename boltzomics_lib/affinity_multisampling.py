@@ -7,6 +7,7 @@ Runs a setting sweep and aggregates affinity outputs into a robust summary.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,17 @@ class MultiSamplingResult:
     aggregated_value: Optional[float]
     aggregated_probability: Optional[float]
     selected_setting: Optional[str]
+    message: str = ""
+
+
+@dataclass
+class _InProcessSweepResult:
+    success: bool
+    per_setting: Dict[str, Dict[str, Any]]
+    executed_settings: List[str]
+    skipped_due_convergence: List[str]
+    running_trace: List[Dict[str, Any]]
+    early_stop_triggered: bool
     message: str = ""
 
 
@@ -272,6 +284,371 @@ def _pick_recommended_setting(
     return settings[len(settings) // 2]
 
 
+def _can_use_inprocess_sweep(yaml_path: Path, use_cached_msa: bool, devices: int) -> bool:
+    """Conservative eligibility gate for in-process affinity sweep."""
+    if int(devices) != 1:
+        return False
+    if not bool(use_cached_msa):
+        return False
+    flag = str(os.getenv("BOLTZOMICS_MULTISAMPLING_INPROCESS", "1")).strip().lower()
+    if flag in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def _run_affinity_sweep_inprocess(
+    *,
+    yaml_path: Path,
+    sweep_profiles: List[Dict[str, int]],
+    aggregate_mode: str,
+    early_stop_enabled: bool,
+    early_stop_min_points: int,
+    early_stop_delta: float,
+    early_stop_std: float,
+    early_stop_patience: int,
+    affinity_mw_correction: bool,
+    max_msa_seqs: int,
+    timeout: int,
+) -> _InProcessSweepResult:
+    """Run all settings in a single Python process while reusing one loaded affinity model."""
+    temp_dir: Optional["tempfile.TemporaryDirectory"] = None
+    try:
+        from dataclasses import asdict
+        from pathlib import Path as _Path
+        import tempfile
+        import torch
+        import yaml
+        from pytorch_lightning import Trainer
+
+        from boltz.main import (
+            Boltz2DiffusionParams,
+            BoltzAffinityWriter,
+            BoltzProcessedInput,
+            MSAModuleArgs,
+            PairformerArgsV2,
+            check_inputs,
+            download_boltz2,
+            filter_inputs_affinity,
+            process_inputs,
+        )
+        from boltz.model.models.boltz2 import Boltz2
+        from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
+    except Exception as exc:
+        return _InProcessSweepResult(
+            success=False,
+            per_setting={},
+            executed_settings=[],
+            skipped_due_convergence=[],
+            running_trace=[],
+            early_stop_triggered=False,
+            message=f"in-process imports unavailable: {exc}",
+        )
+
+    try:
+        # Mirror boltz.main.predict setup for affinity-only execution.
+        torch.set_grad_enabled(False)
+        torch.set_float32_matmul_precision("highest")
+
+        yaml_path = _Path(yaml_path).expanduser().resolve()
+        cache = _Path("~/.boltz").expanduser()
+        cache.mkdir(parents=True, exist_ok=True)
+        download_boltz2(cache)
+        out_dir = yaml_path.parent / f"boltz_results_{yaml_path.stem}"
+
+        inprocess_yaml_path = yaml_path
+        try:
+            yaml_obj = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+        except Exception:
+            yaml_obj = None
+        protein_block = None
+        if isinstance(yaml_obj, dict):
+            seqs = yaml_obj.get("sequences")
+            if isinstance(seqs, list) and seqs and isinstance(seqs[0], dict):
+                protein_block = seqs[0].get("protein")
+        has_msa = isinstance(protein_block, dict) and bool(protein_block.get("msa"))
+        if not has_msa:
+            msa_csv = out_dir / "msa" / f"{yaml_path.stem}_0.csv"
+            if not msa_csv.exists():
+                return _InProcessSweepResult(
+                    success=False,
+                    per_setting={},
+                    executed_settings=[],
+                    skipped_due_convergence=[],
+                    running_trace=[],
+                    early_stop_triggered=False,
+                    message=f"missing cached MSA CSV for in-process path: {msa_csv}",
+                )
+            if not isinstance(protein_block, dict):
+                return _InProcessSweepResult(
+                    success=False,
+                    per_setting={},
+                    executed_settings=[],
+                    skipped_due_convergence=[],
+                    running_trace=[],
+                    early_stop_triggered=False,
+                    message="cannot inject cached MSA: invalid YAML structure",
+                )
+            protein_block["msa"] = str(msa_csv.resolve())
+            temp_dir = tempfile.TemporaryDirectory(prefix="affinity_inprocess_")
+            inprocess_yaml_path = _Path(temp_dir.name) / yaml_path.name
+            inprocess_yaml_path.write_text(
+                yaml.safe_dump(yaml_obj, sort_keys=False),
+                encoding="utf-8",
+            )
+
+        data_checked = check_inputs(inprocess_yaml_path)
+
+        manifest = process_inputs(
+            data=data_checked,
+            out_dir=out_dir,
+            ccd_path=cache / "ccd.pkl",
+            mol_dir=cache / "mols",
+            use_msa_server=False,
+            msa_server_url="https://api.colabfold.com",
+            msa_pairing_strategy="greedy",
+            boltz2=True,
+            preprocessing_threads=max(1, int(os.cpu_count() or 1)),
+            max_msa_seqs=int(max_msa_seqs),
+        )
+        if not any(getattr(r, "affinity", False) for r in manifest.records):
+            return _InProcessSweepResult(
+                success=False,
+                per_setting={},
+                executed_settings=[],
+                skipped_due_convergence=[],
+                running_trace=[],
+                early_stop_triggered=False,
+                message="manifest has no affinity records",
+            )
+
+        processed_dir = out_dir / "processed"
+        processed = BoltzProcessedInput(
+            manifest=manifest,
+            targets_dir=processed_dir / "structures",
+            msa_dir=processed_dir / "msa",
+            constraints_dir=(
+                (processed_dir / "constraints")
+                if (processed_dir / "constraints").exists()
+                else None
+            ),
+            template_dir=(
+                (processed_dir / "templates")
+                if (processed_dir / "templates").exists()
+                else None
+            ),
+            extra_mols_dir=(
+                (processed_dir / "mols") if (processed_dir / "mols").exists() else None
+            ),
+        )
+
+        diffusion_params = Boltz2DiffusionParams()
+        pairformer_args = PairformerArgsV2()
+        msa_args = MSAModuleArgs(
+            subsample_msa=False,
+            num_subsampled_msa=1024,
+            use_paired_feature=True,
+        )
+        affinity_checkpoint = cache / "boltz2_aff.ckpt"
+        if not affinity_checkpoint.exists():
+            return _InProcessSweepResult(
+                success=False,
+                per_setting={},
+                executed_settings=[],
+                skipped_due_convergence=[],
+                running_trace=[],
+                early_stop_triggered=False,
+                message=f"missing affinity checkpoint: {affinity_checkpoint}",
+            )
+
+        pred_writer = BoltzAffinityWriter(
+            data_dir=processed.targets_dir,
+            output_dir=out_dir / "predictions",
+        )
+        trainer = Trainer(
+            default_root_dir=out_dir,
+            strategy="auto",
+            callbacks=[pred_writer],
+            accelerator="gpu",
+            devices=1,
+            precision="bf16-mixed",
+        )
+
+        first_profile = sweep_profiles[0]
+        base_predict_args = {
+            "recycling_steps": 5,
+            "sampling_steps": int(first_profile["sampling_steps_affinity"]),
+            "diffusion_samples": int(first_profile["diffusion_samples_affinity"]),
+            "max_parallel_samples": 1,
+            "write_confidence_summary": False,
+            "write_full_pae": False,
+            "write_full_pde": False,
+        }
+        model_module = Boltz2.load_from_checkpoint(
+            affinity_checkpoint,
+            strict=True,
+            predict_args=base_predict_args,
+            map_location="cpu",
+            diffusion_process_args=asdict(diffusion_params),
+            ema=False,
+            pairformer_args=asdict(pairformer_args),
+            msa_args=asdict(msa_args),
+            steering_args={"fk_steering": False, "guidance_update": False},
+            affinity_mw_correction=bool(affinity_mw_correction),
+        )
+        model_module.eval()
+
+        per_setting: Dict[str, Dict[str, Any]] = {}
+        executed_settings: List[str] = []
+        skipped_due_convergence: List[str] = []
+        running_trace: List[Dict[str, Any]] = []
+        running_values: List[float] = []
+        prev_running_agg: Optional[float] = None
+        convergence_streak = 0
+        early_stop_triggered = False
+
+        for idx, profile in enumerate(sweep_profiles):
+            label = str(profile["label"])
+            # Force recompute affinity for each setting by removing current output.
+            for record in manifest.records:
+                affinity_path = out_dir / "predictions" / record.id / f"affinity_{record.id}.json"
+                try:
+                    if affinity_path.exists():
+                        affinity_path.unlink()
+                except Exception:
+                    pass
+
+            manifest_filtered = filter_inputs_affinity(
+                manifest=manifest,
+                outdir=out_dir,
+                override=False,
+            )
+            if not manifest_filtered.records:
+                break
+
+            model_module.predict_args["sampling_steps"] = int(profile["sampling_steps_affinity"])
+            model_module.predict_args["diffusion_samples"] = int(profile["diffusion_samples_affinity"])
+
+            data_module = Boltz2InferenceDataModule(
+                manifest=manifest_filtered,
+                target_dir=out_dir / "predictions",
+                msa_dir=processed.msa_dir,
+                mol_dir=cache / "mols",
+                num_workers=2,
+                constraints_dir=processed.constraints_dir,
+                template_dir=processed.template_dir,
+                extra_mols_dir=processed.extra_mols_dir,
+                override_method="other",
+                affinity=True,
+            )
+            trainer.callbacks[0] = BoltzAffinityWriter(
+                data_dir=processed.targets_dir,
+                output_dir=out_dir / "predictions",
+            )
+            trainer.predict(
+                model_module,
+                datamodule=data_module,
+                return_predictions=False,
+            )
+
+            # Multi-sampling currently operates on single YAML per call.
+            record_id = manifest.records[0].id
+            affinity_path = out_dir / "predictions" / record_id / f"affinity_{record_id}.json"
+            if not affinity_path.exists():
+                continue
+            setting_data = _read_json(affinity_path)
+            setting_data["sampling_steps_affinity"] = int(profile["sampling_steps_affinity"])
+            setting_data["diffusion_samples_affinity"] = int(profile["diffusion_samples_affinity"])
+            per_setting[label] = setting_data
+            executed_settings.append(label)
+            _write_json(
+                out_dir / "predictions" / record_id / f"affinity_{record_id}_setting_{label}.json",
+                setting_data,
+            )
+
+            # Optional convergence-aware early stopping.
+            if early_stop_enabled:
+                value_now = _safe_float(setting_data.get("affinity_pred_value"))
+                if value_now is not None:
+                    running_values.append(float(value_now))
+                if (
+                    idx < (len(sweep_profiles) - 1)
+                    and len(running_values) >= max(2, int(early_stop_min_points))
+                ):
+                    running_arr = np.array(running_values, dtype=float)
+                    running_agg = _aggregate(running_arr, aggregate_mode)
+                    running_std = (
+                        float(np.std(running_arr, ddof=1))
+                        if running_arr.size > 1
+                        else 0.0
+                    )
+                    delta = (
+                        abs(float(running_agg) - float(prev_running_agg))
+                        if prev_running_agg is not None
+                        else None
+                    )
+                    running_trace.append(
+                        {
+                            "setting": label,
+                            "n": int(running_arr.size),
+                            "running_aggregate": float(running_agg),
+                            "running_std": float(running_std),
+                            "delta_vs_prev": float(delta) if delta is not None else None,
+                        }
+                    )
+                    if (
+                        delta is not None
+                        and float(delta) <= float(max(0.0, early_stop_delta))
+                        and float(running_std) <= float(max(0.0, early_stop_std))
+                    ):
+                        convergence_streak += 1
+                    else:
+                        convergence_streak = 0
+                    prev_running_agg = float(running_agg)
+
+                    if convergence_streak >= max(1, int(early_stop_patience)):
+                        early_stop_triggered = True
+                        skipped_due_convergence = [
+                            str(item["label"]) for item in sweep_profiles[idx + 1 :]
+                        ]
+                        break
+
+        if not per_setting:
+            return _InProcessSweepResult(
+                success=False,
+                per_setting={},
+                executed_settings=[],
+                skipped_due_convergence=[],
+                running_trace=[],
+                early_stop_triggered=False,
+                message="in-process sweep produced no settings",
+            )
+        return _InProcessSweepResult(
+            success=True,
+            per_setting=per_setting,
+            executed_settings=executed_settings,
+            skipped_due_convergence=skipped_due_convergence,
+            running_trace=running_trace,
+            early_stop_triggered=early_stop_triggered,
+            message="",
+        )
+    except Exception as exc:
+        return _InProcessSweepResult(
+            success=False,
+            per_setting={},
+            executed_settings=[],
+            skipped_due_convergence=[],
+            running_trace=[],
+            early_stop_triggered=False,
+            message=f"in-process sweep failed: {exc}",
+        )
+    finally:
+        if temp_dir is not None:
+            try:
+                temp_dir.cleanup()
+            except Exception:
+                pass
+
+
 def run_affinity_multisampling(
     yaml_filepath: str,
     *,
@@ -433,8 +810,39 @@ def run_affinity_multisampling(
     prev_running_agg: Optional[float] = None
     convergence_streak = 0
     early_stop_triggered = False
+    inprocess_used = False
+    inprocess_fallback_reason: Optional[str] = None
 
-    for idx, profile in enumerate(sweep_profiles):
+    if _can_use_inprocess_sweep(
+        yaml_path=yaml_path,
+        use_cached_msa=use_cached_msa,
+        devices=devices,
+    ):
+        inproc = _run_affinity_sweep_inprocess(
+            yaml_path=yaml_path,
+            sweep_profiles=sweep_profiles,
+            aggregate_mode=aggregate_mode,
+            early_stop_enabled=early_stop_enabled,
+            early_stop_min_points=early_stop_min_points,
+            early_stop_delta=early_stop_delta,
+            early_stop_std=early_stop_std,
+            early_stop_patience=early_stop_patience,
+            affinity_mw_correction=affinity_mw_correction,
+            max_msa_seqs=max_msa_seqs,
+            timeout=timeout,
+        )
+        if inproc.success:
+            per_setting = dict(inproc.per_setting)
+            executed_settings = list(inproc.executed_settings)
+            skipped_due_convergence = list(inproc.skipped_due_convergence)
+            running_trace = list(inproc.running_trace)
+            early_stop_triggered = bool(inproc.early_stop_triggered)
+            inprocess_used = True
+        else:
+            inprocess_fallback_reason = inproc.message
+
+    iter_profiles: List[Dict[str, int]] = [] if inprocess_used else list(sweep_profiles)
+    for idx, profile in enumerate(iter_profiles):
         label = str(profile["label"])
         step_now = int(profile["sampling_steps_affinity"])
         diff_now = int(profile["diffusion_samples_affinity"])
@@ -757,6 +1165,8 @@ def run_affinity_multisampling(
             if ci95_low is not None and ci95_high is not None
             else None
         ),
+        "affinity_multisampling_inprocess_used": bool(inprocess_used),
+        "affinity_multisampling_inprocess_fallback_reason": inprocess_fallback_reason,
         "affinity_multisampling_setting_values": {
             label: setting_values_map.get(label)
             for label in requested_settings
