@@ -317,7 +317,7 @@ def parse_protein_chains(protein_sequence, msa_path=None):
             protein_chains.append(protein_entry)
     return protein_chains
 
-def create_boltz_yaml(workspace_name, design_name, protein_sequence, ligand_smiles, binding_pocket_constraints=None, cofactor_info=None, template_cif_path=None, ptm_modifications=None, msa_path=None):
+def create_boltz_yaml(workspace_name, design_name, protein_sequence, ligand_smiles, binding_pocket_constraints=None, cofactor_info=None, template_cif_path=None, ptm_modifications=None, msa_path=None, template_options=None):
     """Create a YAML file for Boltz prediction.
 
     Args:
@@ -435,7 +435,8 @@ def create_boltz_yaml(workspace_name, design_name, protein_sequence, ligand_smil
             "pocket": {
                 "binder": binding_pocket_constraints.get('binder', 'X'),
                 "contacts": contacts,
-                "max_distance": float(binding_pocket_constraints.get('max_distance', 5.0))
+                "max_distance": float(binding_pocket_constraints.get('max_distance', 6.0)),
+                "force": bool(binding_pocket_constraints.get('force', False)),
             }
         }
         import copy
@@ -451,6 +452,7 @@ def create_boltz_yaml(workspace_name, design_name, protein_sequence, ligand_smil
                 contacts_str = yaml.dump(constraint['pocket']['contacts'], default_flow_style=True).strip()
                 f.write(f"      contacts: {contacts_str}\n")
                 f.write(f"      max_distance: {constraint['pocket']['max_distance']}\n")
+                f.write(f"      force: {str(constraint['pocket']['force']).lower()}\n")
             # Always append the properties block for affinity prediction
             f.write("properties:\n")
             f.write("  - affinity:\n")
@@ -463,9 +465,22 @@ def create_boltz_yaml(workspace_name, design_name, protein_sequence, ligand_smil
             f.write("  - affinity:\n")
             f.write("      binder: X\n")
 
-    # Add templates section if template_cif_path is provided
+    # Boltz 2.2 supports CIF and PDB templates plus optional enforced-template
+    # potentials. This legacy helper writes its file above, so append the block.
     if template_cif_path:
-        yaml_content["templates"] = [{"cif": template_cif_path}]
+        options = template_options or {}
+        template_entry = {
+            "pdb" if str(template_cif_path).lower().endswith(".pdb") else "cif": template_cif_path
+        }
+        if options.get("chain_id"):
+            template_entry["chain_id"] = options["chain_id"]
+        if options.get("template_id"):
+            template_entry["template_id"] = options["template_id"]
+        if options.get("force"):
+            template_entry["force"] = True
+            template_entry["threshold"] = float(options.get("threshold", 2.0))
+        with open(filepath, "a") as f:
+            yaml.dump({"templates": [template_entry]}, f, default_flow_style=False, sort_keys=False)
 
     return filepath
 
@@ -477,7 +492,7 @@ def run_boltz_prediction(
     sampling_steps=200,
     diffusion_samples=1,
     max_parallel_samples=5,
-    step_scale=1.638,
+    step_scale=1.5,
     affinity_mw_correction=False,
     max_msa_seqs=8192,
     sampling_steps_affinity=200,
@@ -490,6 +505,13 @@ def run_boltz_prediction(
     devices=1,
     cuda_visible_devices=None,
     preprocessing_threads=1,
+    seed=None,
+    no_kernels=False,
+    write_full_pae=False,
+    write_full_pde=False,
+    write_embeddings=False,
+    msa_server_url=None,
+    msa_pairing_strategy="greedy",
     use_potentials=False,
     method=None,
     external_boltz_patch_enabled=False,
@@ -523,6 +545,13 @@ def run_boltz_prediction(
         devices: Number of accelerator devices for Boltz Trainer.
         cuda_visible_devices: Optional CUDA_VISIBLE_DEVICES value for GPU pinning.
         preprocessing_threads: Boltz preprocessing thread count.
+        seed: Optional random seed for reproducible prediction.
+        no_kernels: Disable optional CUDA kernels for compatibility.
+        write_full_pae: Save the full predicted aligned error matrix.
+        write_full_pde: Save the full predicted distance error matrix.
+        write_embeddings: Save single and pair embeddings.
+        msa_server_url: Optional custom MMSeqs2-compatible server URL.
+        msa_pairing_strategy: MSA pairing strategy (``greedy`` or ``complete``).
         use_potentials: Whether to enable Boltz inference-time potentials.
         method: Optional Boltz method prior (e.g., 'electron microscopy').
         external_boltz_patch_enabled: Use external runtime patch wrapper (no edits to conda package).
@@ -554,12 +583,25 @@ def run_boltz_prediction(
             cmd = ["boltz", "predict", yaml_filepath, "--output_format", "pdb"]
         if not use_cached_msa:
             cmd.append("--use_msa_server")
+            if msa_server_url:
+                cmd.extend(["--msa_server_url", str(msa_server_url)])
+            cmd.extend(["--msa_pairing_strategy", str(msa_pairing_strategy)])
         cmd.extend(["--accelerator", selected_accelerator])
         cmd.extend(["--devices", str(int(devices))])
         cmd.extend(["--preprocessing-threads", str(int(preprocessing_threads))])
         # Add override flag if specified
         if override:
             cmd.append("--override")
+        if seed is not None:
+            cmd.extend(["--seed", str(int(seed))])
+        if no_kernels:
+            cmd.append("--no_kernels")
+        if write_full_pae:
+            cmd.append("--write_full_pae")
+        if write_full_pde:
+            cmd.append("--write_full_pde")
+        if write_embeddings:
+            cmd.append("--write_embeddings")
         # Add Boltz parameters
         cmd.extend(["--recycling_steps", str(int(recycling_steps))])
         cmd.extend(["--sampling_steps", str(int(sampling_steps))])
@@ -638,7 +680,7 @@ def run_boltz_batch_prediction(
     sampling_steps=200,
     diffusion_samples=1,
     max_parallel_samples=5,
-    step_scale=1.638,
+    step_scale=1.5,
     affinity_mw_correction=False,
     max_msa_seqs=8192,
     sampling_steps_affinity=200,
@@ -648,6 +690,13 @@ def run_boltz_batch_prediction(
     timeout=1800,
     use_potentials=False,
     method=None,
+    seed=None,
+    no_kernels=False,
+    write_full_pae=False,
+    write_full_pde=False,
+    write_embeddings=False,
+    msa_server_url=None,
+    msa_pairing_strategy="greedy",
     external_boltz_patch_enabled=False,
     external_boltz_patch_mode="mutation_aware_v2",
     external_boltz_patch_weight_floor=0.05,
@@ -665,12 +714,25 @@ def run_boltz_batch_prediction(
             cmd = ["boltz", "predict", str(input_path), "--output_format", "pdb"]
         if use_msa_server:
             cmd.append("--use_msa_server")
+            if msa_server_url:
+                cmd.extend(["--msa_server_url", str(msa_server_url)])
+            cmd.extend(["--msa_pairing_strategy", str(msa_pairing_strategy)])
         cmd.extend(["--accelerator", str(accelerator).lower()])
         cmd.extend(["--devices", str(int(devices))])
         cmd.extend(["--preprocessing-threads", str(int(preprocessing_threads))])
 
         if override:
             cmd.append("--override")
+        if seed is not None:
+            cmd.extend(["--seed", str(int(seed))])
+        if no_kernels:
+            cmd.append("--no_kernels")
+        if write_full_pae:
+            cmd.append("--write_full_pae")
+        if write_full_pde:
+            cmd.append("--write_full_pde")
+        if write_embeddings:
+            cmd.append("--write_embeddings")
 
         cmd.extend(["--recycling_steps", str(int(recycling_steps))])
         cmd.extend(["--sampling_steps", str(int(sampling_steps))])

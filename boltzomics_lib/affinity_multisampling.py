@@ -693,6 +693,7 @@ def run_affinity_multisampling(
     robust_outlier_filter: bool = True,
     robust_outlier_zmax: float = 3.5,
     bootstrap_samples: int = 300,
+    boltz_runtime_options: Optional[Dict[str, Any]] = None,
 ) -> MultiSamplingResult:
     yaml_path = Path(yaml_filepath)
     yaml_name = yaml_path.stem
@@ -755,6 +756,7 @@ def run_affinity_multisampling(
             external_boltz_patch_uncertainty_penalty=external_boltz_patch_uncertainty_penalty,
             external_boltz_patch_min_confidence=external_boltz_patch_min_confidence,
             external_boltz_patch_mutation_positions=external_boltz_patch_mutation_positions,
+            **(boltz_runtime_options or {}),
         )
         if not affinity_path.exists():
             raise FileNotFoundError(f"Missing affinity output after rerun: {affinity_path}")

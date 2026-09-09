@@ -327,6 +327,7 @@ def display_binding_pocket_section(protein_sequence: str = None, default_constra
             'binder': 'X',
             'contacts': [],
             'max_distance': 7.0,
+            'force': False,
             'mode': 'automated',
             'sequence': '',
             'manual_residues': ''
@@ -362,13 +363,23 @@ def display_binding_pocket_section(protein_sequence: str = None, default_constra
         binder_chain = "X"  # X is always the ligand
         max_distance = st.number_input(
             "Max distance (Å)",
-            min_value=1.0,
-            max_value=30.0,
+            min_value=4.0,
+            max_value=20.0,
             icon=":material/arrow_range:",
             value=float(default_constraints.get('max_distance', 7.0)),
             step=0.1,
+            help="Boltz 2.2 supports pocket/contact distances from 4 Å to 20 Å.",
             key="batch_max_distance_input"
-    )
+        )
+        force_constraint = st.toggle(
+            "Enforce pocket with potential",
+            value=bool(default_constraints.get('force', False)),
+            help=(
+                "Boltz 2.2: use the corrected pocket-contact potential to enforce this "
+                "distance during diffusion. This also enables --use_potentials."
+            ),
+            key="batch_force_pocket_constraint",
+        )
 
     # Parse protein sequence to get chains
     chains_dict = {}
@@ -450,6 +461,7 @@ def display_binding_pocket_section(protein_sequence: str = None, default_constra
                     'binder': binder_chain.strip(),
                     'contacts': all_contacts,
                     'max_distance': float(max_distance),
+                    'force': bool(force_constraint),
                     'mode': 'automated',
                     'sequence': ','.join([q['seq'] for q in st.session_state['batch_pocket_seq_queries']])
                 }
@@ -475,6 +487,7 @@ def display_binding_pocket_section(protein_sequence: str = None, default_constra
                     'binder': binder_chain.strip(),
                     'contacts': contacts,
                     'max_distance': float(max_distance),
+                    'force': bool(force_constraint),
                     'mode': 'manual',
                     'manual_residues': manual_residues
                 }
