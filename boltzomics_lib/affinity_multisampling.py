@@ -700,9 +700,9 @@ def run_affinity_multisampling(
     out_root = yaml_path.parent / f"boltz_results_{yaml_name}" / "predictions" / yaml_name
     affinity_path = out_root / f"affinity_{yaml_name}.json"
     pre_affinity_path = out_root / f"pre_affinity_{yaml_name}.npz"
-    # Multi-device Boltz runs can race on pre_affinity cache visibility.
-    # In that mode, force --override on each setting for deterministic rebuild.
-    force_override_multidevice = int(devices) > 1
+    # Affinity uses an on-disk structure hand-off which is unsafe under
+    # Lightning multi-rank prediction. Keep each sweep on one device.
+    effective_devices = 1 if str(accelerator).lower() == "gpu" else max(1, int(devices))
     # For setting sweeps, refresh affinity outputs per profile while preserving
     # cached structure/pre_affinity artifacts.
     force_override_setting_runs = False
@@ -744,7 +744,7 @@ def run_affinity_multisampling(
             timeout=timeout,
             use_cached_msa=use_cached_msa,
             accelerator=accelerator,
-            devices=devices,
+            devices=effective_devices,
             cuda_visible_devices=cuda_visible_devices,
             preprocessing_threads=preprocessing_threads,
             use_potentials=use_potentials,
@@ -818,7 +818,7 @@ def run_affinity_multisampling(
     if _can_use_inprocess_sweep(
         yaml_path=yaml_path,
         use_cached_msa=use_cached_msa,
-        devices=devices,
+        devices=effective_devices,
     ):
         inproc = _run_affinity_sweep_inprocess(
             yaml_path=yaml_path,
@@ -915,7 +915,7 @@ def run_affinity_multisampling(
                 force_override=(
                     True
                     if force_override_setting_runs
-                    else (True if force_override_multidevice else bool(override))
+                    else bool(override)
                 ),
             )
         except Exception as exc:
@@ -929,7 +929,7 @@ def run_affinity_multisampling(
                         force_override=(
                             True
                             if force_override_setting_runs
-                            else (True if force_override_multidevice else bool(override))
+                            else bool(override)
                         ),
                     )
                 except Exception:

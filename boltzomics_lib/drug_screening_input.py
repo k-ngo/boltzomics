@@ -69,7 +69,34 @@ def show_sequence_viewer_dialog(protein_sequences: List[Tuple[str, str]]):
     else:
         st.info("No protein sequences available")
 
-def parse_fasta_sequences(fasta_text: str) -> List[Tuple[str, str]]:
+def _deduplicate_name(name: str, used: set, prefix: str) -> str:
+    base = re.sub(r"\s+", " ", str(name or "").strip()) or prefix
+    candidate = base
+    suffix = 2
+    while candidate.casefold() in used:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    used.add(candidate.casefold())
+    return candidate
+
+
+def _normalize_sequence_fragment(fragment: str) -> Tuple[str, List[str]]:
+    corrections: List[str] = []
+    original = fragment
+    fragment = fragment.replace("\ufeff", "")
+    if re.search(r"\d", fragment):
+        fragment = re.sub(r"\d", "", fragment)
+        corrections.append("removed pasted residue numbers")
+    compact = re.sub(r"\s+", "", fragment)
+    if compact != fragment or "\n" in original or "\r" in original:
+        corrections.append("removed sequence whitespace/line breaks")
+    if compact.endswith("*") and "*" not in compact[:-1]:
+        compact = compact[:-1]
+        corrections.append("removed terminal FASTA stop marker (*)")
+    return compact.upper(), corrections
+
+
+def parse_fasta_sequences(fasta_text: str, return_corrections: bool = False):
     """
     Parse FASTA format text and return list of (name, sequence) tuples.
     
@@ -79,36 +106,49 @@ def parse_fasta_sequences(fasta_text: str) -> List[Tuple[str, str]]:
     Returns:
         List of tuples containing (sequence_name, sequence)
     """
-    sequences = []
+    sequences: List[Tuple[str, str]] = []
+    corrections: List[str] = []
+    used_names: set = set()
     current_name = None
-    current_sequence = ""
+    current_fragments: List[str] = []
     
-    lines = fasta_text.strip().split('\n')
+    lines = str(fasta_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+    def flush_sequence() -> None:
+        nonlocal current_name, current_fragments
+        if not current_fragments:
+            return
+        sequence, applied = _normalize_sequence_fragment("\n".join(current_fragments))
+        if sequence:
+            name = _deduplicate_name(current_name, used_names, f"Protein_{len(sequences) + 1}")
+            if current_name is None:
+                corrections.append("added a missing FASTA identifier")
+            elif name != str(current_name).strip():
+                corrections.append("made duplicate/blank FASTA identifiers unique")
+            sequences.append((name, sequence))
+            corrections.extend(applied)
+        current_fragments = []
     
     for line in lines:
         line = line.strip()
         if not line:
             continue
+        if line.startswith(";"):
+            corrections.append("ignored FASTA comment lines")
+            continue
             
         if line.startswith('>'):
-            # Save previous sequence if exists
-            if current_name and current_sequence:
-                sequences.append((current_name, current_sequence))
-            
-            # Start new sequence
-            current_name = line[1:]  # Remove '>' prefix
-            current_sequence = ""
+            flush_sequence()
+            current_name = line[1:].strip() or None
         else:
-            # Add to current sequence
-            current_sequence += line
+            current_fragments.append(line)
     
     # Add the last sequence
-    if current_name and current_sequence:
-        sequences.append((current_name, current_sequence))
-    
-    return sequences
+    flush_sequence()
+    unique_corrections = list(dict.fromkeys(corrections))
+    return (sequences, unique_corrections) if return_corrections else sequences
 
-def parse_smiles_list(smiles_text: str) -> List[Tuple[str, str]]:
+def parse_smiles_list(smiles_text: str, return_corrections: bool = False):
     """
     Parse SMILES text in FASTA format and return list of (name, smiles) tuples.
     
@@ -118,11 +158,53 @@ def parse_smiles_list(smiles_text: str) -> List[Tuple[str, str]]:
     Returns:
         List of tuples containing (drug_name, smiles)
     """
-    drugs = []
+    drugs: List[Tuple[str, str]] = []
+    corrections: List[str] = []
+    used_names: set = set()
     current_name = None
-    current_smiles = ""
-    
-    lines = smiles_text.strip().split('\n')
+    current_fragments: List[str] = []
+
+    lines = str(smiles_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    has_headers = any(line.strip().startswith(">") for line in lines)
+
+    def clean_smiles(value: str) -> str:
+        cleaned = value.strip().strip("`\"'")
+        compact = re.sub(r"\s+", "", cleaned)
+        if compact != value.strip():
+            corrections.append("removed SMILES whitespace or wrapping quotes")
+        return compact
+
+    if not has_headers:
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+            name = None
+            value = line
+            for delimiter in ("\t", ","):
+                if delimiter in line:
+                    possible_name, possible_value = line.split(delimiter, 1)
+                    if possible_name.strip() and possible_value.strip():
+                        name, value = possible_name.strip(), possible_value.strip()
+                        corrections.append("converted a name/SMILES row to FASTA-style input")
+                        break
+            name = _deduplicate_name(name, used_names, f"Drug_{len(drugs) + 1}")
+            if name.startswith("Drug_"):
+                corrections.append("added missing drug identifiers")
+            drugs.append((name, clean_smiles(value)))
+        unique_corrections = list(dict.fromkeys(corrections))
+        return (drugs, unique_corrections) if return_corrections else drugs
+
+    def flush_drug() -> None:
+        nonlocal current_name, current_fragments
+        if current_fragments:
+            value = clean_smiles("".join(current_fragments))
+            if value:
+                name = _deduplicate_name(current_name, used_names, f"Drug_{len(drugs) + 1}")
+                if current_name is None:
+                    corrections.append("added a missing drug identifier")
+                drugs.append((name, value))
+        current_fragments = []
     
     for line in lines:
         line = line.strip()
@@ -130,22 +212,15 @@ def parse_smiles_list(smiles_text: str) -> List[Tuple[str, str]]:
             continue
             
         if line.startswith('>'):
-            # Save previous drug if exists
-            if current_name and current_smiles:
-                drugs.append((current_name, current_smiles))
-            
-            # Start new drug
-            current_name = line[1:]  # Remove '>' prefix
-            current_smiles = ""
+            flush_drug()
+            current_name = line[1:].strip() or None
         else:
-            # Add to current SMILES
-            current_smiles += line
+            current_fragments.append(line)
     
     # Add the last drug
-    if current_name and current_smiles:
-        drugs.append((current_name, current_smiles))
-    
-    return drugs
+    flush_drug()
+    unique_corrections = list(dict.fromkeys(corrections))
+    return (drugs, unique_corrections) if return_corrections else drugs
 
 def validate_smiles(smiles: str) -> bool:
     """
@@ -203,9 +278,16 @@ def validate_protein_sequence(protein_seq: str) -> Tuple[bool, str, Dict[str, st
     Returns:
         tuple: (is_valid, error_message, chains_dict, upper_seq)
     """
-    protein_seq = re.sub(r'\s+', '', protein_seq.upper())
+    raw_input = str(protein_seq or "")
+    if any(line.strip().startswith(">") for line in raw_input.splitlines()):
+        parsed = parse_fasta_sequences(raw_input)
+        if len(parsed) != 1:
+            return False, "Expected exactly one FASTA record in this field.", {}, raw_input
+        protein_seq = parsed[0][1]
+    else:
+        protein_seq, _ = _normalize_sequence_fragment(raw_input)
     if not protein_seq.strip():
-        return True, "", {}, protein_seq
+        return False, "Protein sequence is empty after normalization.", {}, protein_seq
     
     # Check for invalid characters (only uppercase letters and : allowed)
     invalid_chars = re.findall(r'[^A-Z:]', protein_seq)
@@ -1110,7 +1192,7 @@ def parse_mutations(mutation_text: str) -> List[List[Tuple[str, int, str]]]:
             
         mutations = []
         # Split by hyphen to get multiple mutations in one mutant
-        mutation_parts = [s.strip() for s in mutant_str.split('-')]
+        mutation_parts = [s.strip() for s in re.split(r"[-/+]", mutant_str)]
         
         for part in mutation_parts:
             if not part or len(part) < 3:
@@ -1139,8 +1221,9 @@ def parse_mutations(mutation_text: str) -> List[List[Tuple[str, int, str]]]:
                 # Skip invalid mutations
                 continue
         
-        if mutations:
-            mutants.append(mutations)
+        # Preserve one entry per comma-delimited mutant so invalid entries do
+        # not shift subsequent mutations onto the wrong label.
+        mutants.append(mutations)
     
     return mutants
 
@@ -1245,7 +1328,7 @@ def generate_mutant_name_from_text(mutation_text: str) -> str:
             continue
             
         # Split by - to get multiple mutations in one mutant
-        mutation_parts = [s.strip() for s in mutant_str.split('-')]
+        mutation_parts = [s.strip() for s in re.split(r"[-/+]", mutant_str)]
         
         for part in mutation_parts:
             if not part or len(part) < 3:
@@ -1292,7 +1375,7 @@ def verify_mutations_with_wt_residues(wt_sequence: str, mutation_text: str, chai
             continue
             
         # Split by hyphen to get multiple mutations in one mutant
-        mutation_parts = [s.strip() for s in mutation_str.split('-')]
+        mutation_parts = [s.strip() for s in re.split(r"[-/+]", mutation_str)]
         
         for part in mutation_parts:
             if not part or len(part) < 3: 

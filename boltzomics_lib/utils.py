@@ -3,6 +3,10 @@ RDLogger.DisableLog('rdApp.*')
 
 import os
 import subprocess
+import signal
+import math
+import numbers
+import sys
 import yaml
 from collections import OrderedDict
 from pathlib import Path
@@ -484,6 +488,51 @@ def create_boltz_yaml(workspace_name, design_name, protein_sequence, ligand_smil
 
     return filepath
 
+def _run_subprocess_in_process_group(cmd, **kwargs):
+    """Run a command and terminate its whole process group on timeout."""
+    timeout = kwargs.pop("timeout", None)
+    capture_output = bool(kwargs.pop("capture_output", False))
+    if capture_output:
+        if kwargs.get("stdout") is not None or kwargs.get("stderr") is not None:
+            raise ValueError("stdout/stderr may not be used with capture_output")
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    use_process_group = os.name == "posix"
+    process = subprocess.Popen(
+        cmd,
+        start_new_session=use_process_group,
+        **kwargs,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        if use_process_group:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        else:
+            process.terminate()
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            if use_process_group:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.kill()
+            stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(
+            cmd=cmd,
+            timeout=timeout,
+            output=stdout if stdout is not None else exc.output,
+            stderr=stderr if stderr is not None else exc.stderr,
+        ) from exc
+    return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+
+
 def run_boltz_prediction(
     yaml_filepath,
     use_gpu=True,
@@ -578,7 +627,7 @@ def run_boltz_prediction(
         # so we don't need --use_msa_server
         if external_boltz_patch_enabled:
             patch_cli = Path(__file__).resolve().parent / "boltz2_patched_cli.py"
-            cmd = ["python", str(patch_cli), "predict", yaml_filepath, "--output_format", "pdb"]
+            cmd = [sys.executable, str(patch_cli), "predict", yaml_filepath, "--output_format", "pdb"]
         else:
             cmd = ["boltz", "predict", yaml_filepath, "--output_format", "pdb"]
         if not use_cached_msa:
@@ -646,7 +695,7 @@ def run_boltz_prediction(
                 if cleaned:
                     env["BOLTZ2_EXTERNAL_PATCH_MUTATION_POSITIONS"] = ",".join(str(v) for v in cleaned)
 
-        result = subprocess.run(
+        result = _run_subprocess_in_process_group(
             cmd,
             cwd=yaml_dir,
             capture_output=True,
@@ -655,7 +704,10 @@ def run_boltz_prediction(
             env=env,
         )
         if result.returncode != 0:
-            raise Exception(f"Boltz command failed: {result.stderr}")
+            raise Exception(
+                "Boltz command failed:\n"
+                f"{result.stderr or ''}\n{result.stdout or ''}".strip()
+            )
         combined_output = f"{result.stdout or ''}\n{result.stderr or ''}"
         # Boltz can report "Failed to process ... Skipping" while still returning 0.
         if "Failed to process" in combined_output and "Skipping" in combined_output:
@@ -704,12 +756,15 @@ def run_boltz_batch_prediction(
     external_boltz_patch_uncertainty_penalty=0.15,
     external_boltz_patch_min_confidence=0.35,
     external_boltz_patch_mutation_positions=None,
+    structure_only=False,
 ):
     """Run Boltz once on a directory containing multiple YAML inputs."""
     try:
+        input_path = os.path.abspath(str(input_path))
+        working_dir = os.path.abspath(str(working_dir))
         if external_boltz_patch_enabled:
             patch_cli = Path(__file__).resolve().parent / "boltz2_patched_cli.py"
-            cmd = ["python", str(patch_cli), "predict", str(input_path), "--output_format", "pdb"]
+            cmd = [sys.executable, str(patch_cli), "predict", str(input_path), "--output_format", "pdb"]
         else:
             cmd = ["boltz", "predict", str(input_path), "--output_format", "pdb"]
         if use_msa_server:
@@ -718,7 +773,12 @@ def run_boltz_batch_prediction(
                 cmd.extend(["--msa_server_url", str(msa_server_url)])
             cmd.extend(["--msa_pairing_strategy", str(msa_pairing_strategy)])
         cmd.extend(["--accelerator", str(accelerator).lower()])
-        cmd.extend(["--devices", str(int(devices))])
+        effective_devices = (
+            1
+            if (not structure_only and str(accelerator).lower() == "gpu")
+            else max(1, int(devices))
+        )
+        cmd.extend(["--devices", str(effective_devices)])
         cmd.extend(["--preprocessing-threads", str(int(preprocessing_threads))])
 
         if override:
@@ -776,7 +836,7 @@ def run_boltz_batch_prediction(
                     env["BOLTZ2_EXTERNAL_PATCH_MUTATION_POSITIONS"] = ",".join(str(v) for v in cleaned)
 
         print("[DEBUG-BATCH]", " ".join(cmd))
-        result = subprocess.run(
+        result = _run_subprocess_in_process_group(
             cmd,
             cwd=working_dir,
             capture_output=True,
@@ -785,12 +845,56 @@ def run_boltz_batch_prediction(
             env=env,
         )
         if result.returncode != 0:
-            raise Exception(f"Boltz batch command failed: {result.stderr}")
+            raise Exception(
+                "Boltz batch command failed:\n"
+                f"{result.stderr or ''}\n{result.stdout or ''}".strip()
+            )
+        combined_output = f"{result.stdout or ''}\n{result.stderr or ''}"
+        if "Failed to process" in combined_output and "Skipping" in combined_output:
+            raise Exception("Boltz reported batch input processing failure. Check MSA/template/constraint paths.")
         return result.stdout
     except subprocess.TimeoutExpired:
         raise Exception(f"Boltz batch prediction timed out after {timeout or 1800} seconds")
     except Exception as e:
         raise Exception(f"Error running Boltz batch prediction: {str(e)}")
+
+
+def _finite_real(value):
+    return isinstance(value, numbers.Real) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def validate_boltz_output_root(output_root, yaml_name, structure_only=False):
+    """Validate required Boltz JSON files, numeric finiteness, and bounded scores."""
+    prediction_dir = os.path.join(output_root, "predictions", yaml_name)
+    affinity_path = os.path.join(prediction_dir, f"affinity_{yaml_name}.json")
+    confidence_path = os.path.join(prediction_dir, f"confidence_{yaml_name}_model_0.json")
+    required_files = [confidence_path] if structure_only else [affinity_path, confidence_path]
+    for path in required_files:
+        if not os.path.isfile(path):
+            return False, f"Required results file not found: {path}"
+        if os.path.getsize(path) == 0:
+            return False, f"Required results file is empty: {path}"
+    try:
+        if not structure_only:
+            with open(affinity_path, "r", encoding="utf-8") as handle:
+                affinity = json.load(handle)
+            for field in ("affinity_pred_value", "affinity_probability_binary"):
+                if field not in affinity or not _finite_real(affinity[field]):
+                    return False, f"Affinity field '{field}' must be a finite number"
+            probability = float(affinity["affinity_probability_binary"])
+            if not 0.0 <= probability <= 1.0:
+                return False, "Affinity probability must be between 0 and 1"
+
+        with open(confidence_path, "r", encoding="utf-8") as handle:
+            confidence = json.load(handle)
+        for field in ("confidence_score", "ptm", "iptm", "complex_plddt"):
+            if field not in confidence or not _finite_real(confidence[field]):
+                return False, f"Confidence field '{field}' must be a finite number"
+            if not 0.0 <= float(confidence[field]) <= 1.0:
+                return False, f"Confidence field '{field}' must be between 0 and 1"
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return False, f"Invalid Boltz results JSON: {exc}"
+    return True, "Results validation successful"
 
 
 def parse_boltz_results_from_output_root(output_root, yaml_name, structure_only=False):

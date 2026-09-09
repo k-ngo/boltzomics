@@ -122,7 +122,8 @@ class ScreeningJobManager:
 
         def _cleanup() -> None:
             try:
-                self.shutdown(purge_pending=True)
+                # Preserve queued work across an orderly app/server restart.
+                self.shutdown(purge_pending=False)
             except Exception:
                 pass
 
@@ -415,12 +416,24 @@ class ScreeningJobManager:
         except Exception:
             return
         jobs = data.get("jobs", [])
+        recovered_running = False
         for entry in jobs:
             try:
                 job = ScreeningJob.from_dict(entry)
+                # No worker survives a Python process restart. Requeue work that
+                # was persisted as running so it does not remain stuck forever.
+                if job.status == "running":
+                    job.status = "pending"
+                    job.started_at = None
+                    job.completed_at = None
+                    job.error = "Recovered after application restart"
+                    recovered_running = True
                 self.jobs[job.job_id] = job
             except Exception:
                 continue
+        if recovered_running:
+            with self.lock:
+                self._persist_state_locked()
 
     def _persist_state_locked(self) -> None:
         state = {

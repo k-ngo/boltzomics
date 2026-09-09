@@ -19,14 +19,20 @@ PyYAML==6.0.2
 # Machine Learning and Inference
 onnxruntime==1.20.1
 
+# Analysis and benchmark scripts (also required by the full regression suite)
+matplotlib
+seaborn
+scipy
+
 # Chemistry and Drug Discovery
 rdkit
 
 # ChEMBL Web Services
 chembl-webresource-client
 
-# Boltz2 (using 2.0.3 to avoid cuequivariance_ops GPU compatibility issues)
-boltz[cuda]==2.0.3
+# Boltz-2 (2.2.1 adds corrected pocket/contact conditioning, new potentials,
+# optional CUDA kernels, secure MSA-server support, and prediction diagnostics)
+boltz[cuda]==2.2.1
 
 # Structure refinement (energy minimization)
 openmm==8.3

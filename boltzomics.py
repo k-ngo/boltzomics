@@ -150,8 +150,14 @@ QUEUE_STATUS_REFRESH_INTERVAL_SECONDS = 1.0  # Auto-refresh job queue UI every 1
 QUEUE_NEXT_REFRESH_STATE_KEY = "_screening_queue_next_refresh"
 
 
+@st.cache_resource(show_spinner=False)
+def _create_shared_job_manager(state_dir: str) -> ScreeningJobManager:
+    """One queue/worker pool per app process, shared by all browser sessions."""
+    return ScreeningJobManager(os.path.abspath(state_dir))
+
+
 def get_job_manager() -> Optional[ScreeningJobManager]:
-    """Return a cached job manager instance that survives Streamlit reruns."""
+    """Return the process-wide manager that survives reruns and browser sessions."""
     if not USE_SCREENING_JOB_QUEUE or ScreeningJobManager is None:
         return None
 
@@ -166,15 +172,13 @@ def get_job_manager() -> Optional[ScreeningJobManager]:
         except Exception:
             return None
 
-    manager = session_state.get(JOB_MANAGER_SESSION_STATE_KEY)
-    if manager is None:
-        try:
-            manager = ScreeningJobManager(JOB_STATE_DIR)
-        except Exception as exc:
-            session_state[JOB_MANAGER_INIT_ERROR_KEY] = str(exc)
-            session_state[JOB_MANAGER_SESSION_STATE_KEY] = None
-            return None
-        session_state[JOB_MANAGER_SESSION_STATE_KEY] = manager
+    try:
+        manager = _create_shared_job_manager(JOB_STATE_DIR)
+    except Exception as exc:
+        session_state[JOB_MANAGER_INIT_ERROR_KEY] = str(exc)
+        session_state[JOB_MANAGER_SESSION_STATE_KEY] = None
+        return None
+    session_state[JOB_MANAGER_SESSION_STATE_KEY] = manager
     return manager
 
 
@@ -358,6 +362,8 @@ def _prediction_reproducibility_params(params: Dict[str, Any]) -> Dict[str, Any]
         "method",
         "mutation_steering_config",
         "template_cif_path",
+        "template_options",
+        "boltz_runtime_options",
         "binding_pocket_constraints",
         "cofactor_info",
         "ptm_modifications",
@@ -766,6 +772,10 @@ def _resolve_mutation_steering_constraints(
         "binder": binder,
         "contacts": [[chain_id, residue_idx] for chain_id, residue_idx in sorted_contacts],
         "max_distance": max_distance,
+        # Boltz >=2.2 requires force on the individual pocket constraint to
+        # activate its corrected contact potential. --use_potentials alone is
+        # not enough to enforce mutation-neighborhood steering.
+        "force": bool(mutation_steering_config.get("use_potentials", False)),
         "mode": mode,
         "source": "mutation_neighborhood",
         "mutation_positions": mutation_positions,
@@ -797,6 +807,7 @@ def create_screening_boltz_yaml(
     binding_pocket_constraints=None,
     cofactor_info=None,
     template_cif_path=None,
+    template_options=None,
     structure_only=False,
     ptm_modifications=None,
     msa_path=None,
@@ -812,7 +823,8 @@ def create_screening_boltz_yaml(
         project_name: Name of the screening project
         binding_pocket_constraints: Optional binding pocket constraints
         cofactor_info: Optional cofactor information
-        template_cif_path: Optional path to template CIF file
+        template_cif_path: Optional path to a template CIF or PDB file
+        template_options: Optional Boltz 2.2 template mapping/forcing options
         structure_only: If True, skip affinity prediction
         ptm_modifications: Optional post-translational modifications
         msa_path: Optional path to cached MSA file. When provided, Boltz will use
@@ -888,7 +900,18 @@ def create_screening_boltz_yaml(
 
     # Add templates section if template_cif_path is provided
     if template_cif_path:
-        yaml_content["templates"] = [{"cif": os.path.abspath(template_cif_path)}]
+        options = template_options or {}
+        template_entry = {
+            "pdb" if str(template_cif_path).lower().endswith(".pdb") else "cif": os.path.abspath(template_cif_path)
+        }
+        if options.get("chain_id"):
+            template_entry["chain_id"] = options["chain_id"]
+        if options.get("template_id"):
+            template_entry["template_id"] = options["template_id"]
+        if options.get("force"):
+            template_entry["force"] = True
+            template_entry["threshold"] = float(options.get("threshold", 2.0))
+        yaml_content["templates"] = [template_entry]
     
     # Add constraints if provided and valid
     if binding_pocket_constraints and binding_pocket_constraints.get('contacts'):
@@ -905,7 +928,8 @@ def create_screening_boltz_yaml(
             "pocket": {
                 "binder": binding_pocket_constraints.get('binder', 'X'),
                 "contacts": contacts,
-                "max_distance": float(binding_pocket_constraints.get('max_distance', 5.0))
+                "max_distance": float(binding_pocket_constraints.get('max_distance', 6.0)),
+                "force": bool(binding_pocket_constraints.get('force', False)),
             }
         }
         yaml_content_copy = copy.deepcopy(yaml_content)
@@ -920,6 +944,7 @@ def create_screening_boltz_yaml(
                 contacts_str = yaml.dump(constraint['pocket']['contacts'], default_flow_style=True).strip()
                 f.write(f"      contacts: {contacts_str}\n")
                 f.write(f"      max_distance: {constraint['pocket']['max_distance']}\n")
+                f.write(f"      force: {str(constraint['pocket']['force']).lower()}\n")
             if not structure_only:
                 f.write("properties:\n")
                 f.write("  - affinity:\n")
@@ -944,10 +969,12 @@ def validate_boltz_results(yaml_filepath, structure_only=False):
         tuple: (is_valid, error_message)
     """
     try:
-        # Construct the path to the results files
         yaml_dir = os.path.dirname(yaml_filepath)
         yaml_filename = os.path.basename(yaml_filepath)
         yaml_name = os.path.splitext(yaml_filename)[0]
+        output_root = os.path.join(yaml_dir, f"boltz_results_{yaml_name}")
+        if utils is not None and hasattr(utils, "validate_boltz_output_root"):
+            return utils.validate_boltz_output_root(output_root, yaml_name, structure_only)
         # Path to the confidence results JSON file
         confidence_results_path = os.path.join(yaml_dir, f"boltz_results_{yaml_name}", "predictions", yaml_name, f"confidence_{yaml_name}_model_0.json")
         if not structure_only:
@@ -1024,7 +1051,7 @@ def run_boltz_with_retry(
     sampling_steps=200,
     diffusion_samples=1,
     max_parallel_samples=5,
-    step_scale=1.638,
+    step_scale=1.5,
     affinity_mw_correction=False,
     external_boltz_patch_enabled: bool = False,
     external_boltz_patch_mode: str = "mutation_aware_v2",
@@ -1057,6 +1084,7 @@ def run_boltz_with_retry(
     subsample_msa=False,
     num_subsampled_msa=1024,
     template_cif_path=None,
+    template_options: Optional[Dict[str, Any]] = None,
     structure_only=False,
     ptm_modifications=None,
     prediction_timeout_seconds=300,
@@ -1066,6 +1094,7 @@ def run_boltz_with_retry(
     preprocessing_threads: int = 1,
     use_potentials: bool = False,
     method: Optional[str] = None,
+    boltz_runtime_options: Optional[Dict[str, Any]] = None,
     emit_streamlit_feedback=True,
     status_callback: Optional[Callable[[str, Dict[str, Union[str, int, float]]], None]] = None,
     msa_path: Optional[str] = None,
@@ -1091,8 +1120,18 @@ def run_boltz_with_retry(
     force_override_rebuild = False
     force_clean_rebuild = False
     oom_fallback_applied = False
+    pre_affinity_fallback_applied = False
+    kernel_fallback_applied = False
     current_max_parallel_samples = int(max_parallel_samples)
-    current_devices = int(devices)
+    requested_devices = max(1, int(devices))
+    # Boltz affinity uses an on-disk structure-to-affinity hand-off that is not
+    # safe under Lightning multi-rank prediction. Parallelize across jobs instead.
+    current_devices = (
+        1
+        if (not structure_only and str(accelerator).lower() == "gpu")
+        else requested_devices
+    )
+    current_runtime_options = dict(boltz_runtime_options or {})
     patch_mutation_positions = (
         _extract_mutation_positions_from_label(protein_display_name)
         if external_boltz_patch_enabled
@@ -1106,6 +1145,17 @@ def run_boltz_with_retry(
             except Exception:
                 pass
 
+    if current_devices != requested_devices:
+        notify(
+            "affinity_single_device",
+            {
+                "requested_devices": requested_devices,
+                "devices": current_devices,
+                "protein": protein_display_name,
+                "ligand": ligand_display_name,
+            },
+        )
+
     for attempt in range(total_attempts):
         try:
             yaml_filepath = create_screening_boltz_yaml(
@@ -1117,6 +1167,7 @@ def run_boltz_with_retry(
                 binding_pocket_constraints,
                 cofactor_info,
                 template_cif_path,
+                template_options,
                 structure_only,
                 ptm_modifications,
                 msa_path=current_msa_path,  # MSA caching support
@@ -1133,29 +1184,26 @@ def run_boltz_with_retry(
                 yaml_name,
                 f"pre_affinity_{yaml_name}.npz",
             )
-            if force_clean_rebuild and os.path.exists(boltz_output_dir):
-                try:
-                    shutil.rmtree(boltz_output_dir)
-                except Exception:
-                    pass
-                force_clean_rebuild = False
-            if (
-                (not structure_only)
-                and (not override)
-                and (not force_override_rebuild)
-                and os.path.exists(os.path.dirname(pre_affinity_path))
-                and (not os.path.exists(pre_affinity_path))
-            ):
-                force_override_rebuild = True
-                notify(
-                    "pre_affinity_rebuild",
-                    {
-                        "attempt": attempt + 1,
-                        "protein": protein_display_name,
-                        "ligand": ligand_display_name,
-                    },
-                )
             with _boltz_job_file_lock(lock_path):
+                if force_clean_rebuild and os.path.exists(boltz_output_dir):
+                    shutil.rmtree(boltz_output_dir)
+                    force_clean_rebuild = False
+                if (
+                    (not structure_only)
+                    and (not override)
+                    and (not force_override_rebuild)
+                    and os.path.exists(os.path.dirname(pre_affinity_path))
+                    and (not os.path.exists(pre_affinity_path))
+                ):
+                    force_override_rebuild = True
+                    notify(
+                        "pre_affinity_rebuild",
+                        {
+                            "attempt": attempt + 1,
+                            "protein": protein_display_name,
+                            "ligand": ligand_display_name,
+                        },
+                    )
                 utils.run_boltz_prediction(
                     yaml_filepath=yaml_filepath,
                     use_gpu=use_gpu,
@@ -1186,6 +1234,7 @@ def run_boltz_with_retry(
                     preprocessing_threads=preprocessing_threads,
                     use_potentials=use_potentials,
                     method=method,
+                    **current_runtime_options,
                 )
             is_valid, validation_error = validate_boltz_results(yaml_filepath, structure_only=structure_only)
             if not is_valid:
@@ -1247,6 +1296,7 @@ def run_boltz_with_retry(
                             preprocessing_threads=preprocessing_threads,
                             use_potentials=use_potentials,
                             method=method,
+                            **current_runtime_options,
                         )
                     is_valid, validation_error = validate_boltz_results(yaml_filepath, structure_only=structure_only)
                     if not is_valid:
@@ -1282,6 +1332,7 @@ def run_boltz_with_retry(
                         preprocessing_threads=preprocessing_threads,
                         use_potentials=use_potentials,
                         method=method,
+                        boltz_runtime_options=current_runtime_options,
                         external_boltz_patch_enabled=external_boltz_patch_enabled,
                         external_boltz_patch_mode=external_boltz_patch_mode,
                         external_boltz_patch_weight_floor=external_boltz_patch_weight_floor,
@@ -1353,12 +1404,33 @@ def run_boltz_with_retry(
                 or ("ran out of memory" in last_error_lower)
                 or ("number of failed examples" in last_error_lower)
             )
+            kernel_compatibility_failure = any(
+                marker in last_error_lower
+                for marker in (
+                    "nvmLError_notsupported".lower(),
+                    "nvmlerror_notsupported",
+                    "cuequivariance_ops",
+                    "cuequivariance_torch",
+                    "triton.runtime.errors",
+                )
+            )
+            # Boltz reports this failure as a nested DataLoader traceback.  Depending
+            # on the Python/Boltz version, it says either "not found",
+            # "FileNotFoundError", or just "No such file or directory".
             missing_pre_affinity_cache = (
                 "pre_affinity_" in last_error_lower
-                and "not found" in last_error_lower
+                and any(
+                    marker in last_error_lower
+                    for marker in (
+                        "not found",
+                        "filenotfounderror",
+                        "no such file or directory",
+                    )
+                )
             )
             if (
                 oom_failure
+                and enable_retries
                 and attempt < max_retry_attempts
                 and not oom_fallback_applied
             ):
@@ -1384,14 +1456,48 @@ def run_boltz_with_retry(
                     )
                 continue
             if (
-                (not structure_only)
-                and missing_pre_affinity_cache
-                and (not override)
-                and (not force_override_rebuild)
+                kernel_compatibility_failure
+                and enable_retries
+                and not bool(current_runtime_options.get("no_kernels", False))
+                and not kernel_fallback_applied
                 and attempt < max_retry_attempts
             ):
+                kernel_fallback_applied = True
+                current_runtime_options["no_kernels"] = True
                 force_override_rebuild = True
                 force_clean_rebuild = True
+                current_devices = 1
+                notify(
+                    "kernel_compatibility_retry",
+                    {
+                        "attempt": attempt + 1,
+                        "protein": protein_display_name,
+                        "ligand": ligand_display_name,
+                        "error": last_error[:200],
+                    },
+                )
+                if emit_streamlit_feedback:
+                    st.warning(
+                        "Optional CUDA kernels are incompatible with this GPU/driver; "
+                        "retrying safely with --no_kernels on one device."
+                    )
+                continue
+            if (
+                (not structure_only)
+                and enable_retries
+                and missing_pre_affinity_cache
+                and (not pre_affinity_fallback_applied)
+                and attempt < max_retry_attempts
+            ):
+                # This can occur on a brand-new --override run as well as with stale
+                # cached output.  It is especially common with Lightning multi-rank
+                # prediction: a non-zero rank can try to read the rank-zero affinity
+                # hand-off before it is visible.  Rebuild cleanly on one device.
+                pre_affinity_fallback_applied = True
+                force_override_rebuild = True
+                force_clean_rebuild = True
+                if str(accelerator).lower() == "gpu":
+                    current_devices = 1
                 notify(
                     "pre_affinity_rebuild_retry",
                     {
@@ -1403,7 +1509,8 @@ def run_boltz_with_retry(
                 )
                 if emit_streamlit_feedback:
                     st.warning(
-                        "Detected incomplete cached outputs; retrying this job from a clean output folder."
+                        "Detected an incomplete Boltz affinity hand-off; retrying this job "
+                        "from a clean output folder on one device."
                     )
                 continue
 
@@ -1416,6 +1523,7 @@ def run_boltz_with_retry(
             cached_input_processing_failure = "input processing failure" in last_error.lower()
             if (
                 current_use_cached_msa
+                and enable_retries
                 and (missing_affinity_output or cached_input_processing_failure)
                 and attempt < max_retry_attempts
             ):
@@ -1501,7 +1609,7 @@ def _build_boltz_command(yaml_filename: str, params: Dict[str, Any]) -> str:
     external_patch_enabled = bool(params.get("external_boltz_patch_enabled", False))
     if external_patch_enabled:
         patch_cli = os.path.join(MODULES_DIR, "boltz2_patched_cli.py")
-        cmd: List[str] = ["python", patch_cli, "predict", yaml_filename]
+        cmd: List[str] = [sys.executable, patch_cli, "predict", yaml_filename]
     else:
         cmd = ["boltz", "predict", yaml_filename]
     if not params.get("use_cached_msa", False):
@@ -1509,7 +1617,10 @@ def _build_boltz_command(yaml_filename: str, params: Dict[str, Any]) -> str:
     cmd.extend(["--output_format", "pdb"])
     accelerator = str(params.get("accelerator", "gpu")).lower()
     cmd.extend(["--accelerator", accelerator])
-    cmd.extend(["--devices", str(int(params.get("devices", 1)))])
+    preview_devices = max(1, int(params.get("devices", 1)))
+    if accelerator == "gpu" and not bool(params.get("structure_only", False)):
+        preview_devices = 1
+    cmd.extend(["--devices", str(preview_devices)])
     cmd.extend(["--preprocessing-threads", str(int(params.get("preprocessing_threads", 1)))])
     if params.get("override"):
         cmd.append("--override")
@@ -1517,7 +1628,22 @@ def _build_boltz_command(yaml_filename: str, params: Dict[str, Any]) -> str:
     cmd.extend(["--sampling_steps", str(int(params.get("sampling_steps", 200)))])
     cmd.extend(["--diffusion_samples", str(int(params.get("diffusion_samples", 1)))])
     cmd.extend(["--max_parallel_samples", str(int(params.get("max_parallel_samples", 5)))])
-    cmd.extend(["--step_scale", str(float(params.get("step_scale", 1.638)))])
+    cmd.extend(["--step_scale", str(float(params.get("step_scale", 1.5)))])
+    runtime = params.get("boltz_runtime_options") or {}
+    if runtime.get("seed") is not None:
+        cmd.extend(["--seed", str(int(runtime["seed"]))])
+    for key, flag in (
+        ("no_kernels", "--no_kernels"),
+        ("write_full_pae", "--write_full_pae"),
+        ("write_full_pde", "--write_full_pde"),
+        ("write_embeddings", "--write_embeddings"),
+    ):
+        if runtime.get(key):
+            cmd.append(flag)
+    if not params.get("use_cached_msa", False):
+        if runtime.get("msa_server_url"):
+            cmd.extend(["--msa_server_url", str(runtime["msa_server_url"])])
+        cmd.extend(["--msa_pairing_strategy", str(runtime.get("msa_pairing_strategy", "greedy"))])
     if params.get("affinity_mw_correction"):
         cmd.append("--affinity_mw_correction")
     if params.get("use_potentials"):
@@ -1552,7 +1678,7 @@ def _build_boltz_batch_command(input_path: str, params: Dict[str, Any], use_msa_
     external_patch_enabled = bool(params.get("external_boltz_patch_enabled", False))
     if external_patch_enabled:
         patch_cli = os.path.join(MODULES_DIR, "boltz2_patched_cli.py")
-        cmd: List[str] = ["python", patch_cli, "predict", input_path]
+        cmd: List[str] = [sys.executable, patch_cli, "predict", input_path]
     else:
         cmd = ["boltz", "predict", input_path]
     if use_msa_server:
@@ -1560,7 +1686,10 @@ def _build_boltz_batch_command(input_path: str, params: Dict[str, Any], use_msa_
     cmd.extend(["--output_format", "pdb"])
     accelerator = str(params.get("accelerator", "gpu")).lower()
     cmd.extend(["--accelerator", accelerator])
-    cmd.extend(["--devices", str(int(params.get("devices", 1)))])
+    preview_devices = max(1, int(params.get("devices", 1)))
+    if accelerator == "gpu" and not bool(params.get("structure_only", False)):
+        preview_devices = 1
+    cmd.extend(["--devices", str(preview_devices)])
     cmd.extend(["--preprocessing-threads", str(int(params.get("preprocessing_threads", 1)))])
     if params.get("override"):
         cmd.append("--override")
@@ -1568,7 +1697,22 @@ def _build_boltz_batch_command(input_path: str, params: Dict[str, Any], use_msa_
     cmd.extend(["--sampling_steps", str(int(params.get("sampling_steps", 200)))])
     cmd.extend(["--diffusion_samples", str(int(params.get("diffusion_samples", 1)))])
     cmd.extend(["--max_parallel_samples", str(int(params.get("max_parallel_samples", 5)))])
-    cmd.extend(["--step_scale", str(float(params.get("step_scale", 1.638)))])
+    cmd.extend(["--step_scale", str(float(params.get("step_scale", 1.5)))])
+    runtime = params.get("boltz_runtime_options") or {}
+    if runtime.get("seed") is not None:
+        cmd.extend(["--seed", str(int(runtime["seed"]))])
+    for key, flag in (
+        ("no_kernels", "--no_kernels"),
+        ("write_full_pae", "--write_full_pae"),
+        ("write_full_pde", "--write_full_pde"),
+        ("write_embeddings", "--write_embeddings"),
+    ):
+        if runtime.get(key):
+            cmd.append(flag)
+    if use_msa_server:
+        if runtime.get("msa_server_url"):
+            cmd.extend(["--msa_server_url", str(runtime["msa_server_url"])])
+        cmd.extend(["--msa_pairing_strategy", str(runtime.get("msa_pairing_strategy", "greedy"))])
     if params.get("affinity_mw_correction"):
         cmd.append("--affinity_mw_correction")
     if params.get("use_potentials"):
@@ -1852,6 +1996,7 @@ def _create_result_entry(
         "design": design_name,
         "cofactor_info": params.get("cofactor_info"),
         "boltz2_parameters": {
+            "boltz_version": "2.2.1",
             "use_gpu": params.get("use_gpu", True),
             "accelerator": params.get("accelerator", "gpu"),
             "devices": params.get("devices", 1),
@@ -1861,7 +2006,9 @@ def _create_result_entry(
             "sampling_steps": params.get("sampling_steps", 200),
             "diffusion_samples": params.get("diffusion_samples", 1),
             "max_parallel_samples": params.get("max_parallel_samples", 5),
-            "step_scale": params.get("step_scale", 1.638),
+            "step_scale": params.get("step_scale", 1.5),
+            "runtime_options": params.get("boltz_runtime_options") or {},
+            "template_options": params.get("template_options") or {},
             "affinity_mw_correction": params.get("affinity_mw_correction", False),
             "affinity_consensus_enabled": params.get("affinity_consensus_enabled", False),
             "affinity_consensus_mode": params.get("affinity_consensus_mode", "weighted"),
@@ -1981,7 +2128,7 @@ def execute_screening_job(job: ScreeningJob, worker_id: int = 0) -> Tuple[Dict[s
         sampling_steps=params.get("sampling_steps", 200),
         diffusion_samples=params.get("diffusion_samples", 1),
         max_parallel_samples=params.get("max_parallel_samples", 5),
-        step_scale=params.get("step_scale", 1.638),
+        step_scale=params.get("step_scale", 1.5),
         affinity_mw_correction=params.get("affinity_mw_correction", False),
         external_boltz_patch_enabled=params.get("external_boltz_patch_enabled", False),
         external_boltz_patch_mode=params.get("external_boltz_patch_mode", "mutation_aware_v2"),
@@ -2014,6 +2161,7 @@ def execute_screening_job(job: ScreeningJob, worker_id: int = 0) -> Tuple[Dict[s
         subsample_msa=params.get("subsample_msa", False),
         num_subsampled_msa=params.get("num_subsampled_msa", 1024),
         template_cif_path=params.get("template_cif_path"),
+        template_options=params.get("template_options"),
         structure_only=job.structure_only,
         ptm_modifications=params.get("ptm_modifications"),
         prediction_timeout_seconds=params.get("prediction_timeout_seconds", 300),
@@ -2023,6 +2171,7 @@ def execute_screening_job(job: ScreeningJob, worker_id: int = 0) -> Tuple[Dict[s
         preprocessing_threads=params.get("preprocessing_threads", 1),
         use_potentials=params.get("use_potentials", False),
         method=params.get("method"),
+        boltz_runtime_options=params.get("boltz_runtime_options"),
         emit_streamlit_feedback=False,
         msa_path=msa_path,
         use_cached_msa=use_cached_msa,
@@ -2587,7 +2736,7 @@ def run_screening_prediction(
     sampling_steps: int = 300,
     diffusion_samples: int = 1,
     max_parallel_samples: int = 5,
-    step_scale: float = 1.638,
+    step_scale: float = 1.5,
     affinity_mw_correction: bool = False,
     affinity_consensus_enabled: bool = False,
     affinity_consensus_mode: str = "weighted",
@@ -2624,6 +2773,7 @@ def run_screening_prediction(
     subsample_msa: bool = False,
     num_subsampled_msa: int = 1024,
     template_cif_path: Optional[str] = None,
+    template_options: Optional[Dict[str, Any]] = None,
     structure_only: bool = False,
     ptm_modifications: Optional[Dict] = None,
     prediction_timeout_seconds: int = 300,
@@ -2635,6 +2785,7 @@ def run_screening_prediction(
     enable_batch_execution: bool = True,
     use_potentials: bool = False,
     method: Optional[str] = None,
+    boltz_runtime_options: Optional[Dict[str, Any]] = None,
     mutation_steering_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict], float]:
     """Run screening prediction using Boltz2."""
@@ -2738,6 +2889,8 @@ def run_screening_prediction(
                 "max_retry_attempts": max_retry_attempts,
                 "retry_delay_base": retry_delay_base,
                 "template_cif_path": template_cif_path,
+                "template_options": template_options,
+                "boltz_runtime_options": boltz_runtime_options or {},
                 "use_cached_msa": command_params.get("use_cached_msa", False),
                 "enable_msa_cache": enable_msa_cache,
                 "override": command_params["override"],
@@ -2819,6 +2972,8 @@ def run_screening_prediction(
                 "subsample_msa": subsample_msa,
                 "num_subsampled_msa": num_subsampled_msa,
                 "template_cif_path": template_cif_path,
+                "template_options": template_options,
+                "boltz_runtime_options": boltz_runtime_options or {},
                 "mutation_steering_config": mutation_steering_config,
                 "binding_pocket_constraints": _resolve_mutation_steering_constraints(
                     protein_name=protein_name,
@@ -2984,6 +3139,7 @@ def run_screening_prediction(
                         subsample_msa=cp.get("subsample_msa", subsample_msa),
                         num_subsampled_msa=cp.get("num_subsampled_msa", num_subsampled_msa),
                         template_cif_path=cp.get("template_cif_path", template_cif_path),
+                        template_options=cp.get("template_options", template_options),
                         structure_only=structure_only,
                         ptm_modifications=ptm_modifications,
                         prediction_timeout_seconds=cp.get("prediction_timeout_seconds", prediction_timeout_seconds),
@@ -2993,6 +3149,7 @@ def run_screening_prediction(
                         preprocessing_threads=cp.get("preprocessing_threads", preprocessing_threads),
                         use_potentials=cp.get("use_potentials", False),
                         method=cp.get("method"),
+                        boltz_runtime_options=cp.get("boltz_runtime_options", boltz_runtime_options),
                         msa_path=None,
                         use_cached_msa=False,
                         enable_msa_cache=enable_msa_cache,
@@ -3091,6 +3248,8 @@ def run_screening_prediction(
                     "affinity_multisampling_robust_outlier_filter",
                     "affinity_multisampling_robust_outlier_zmax",
                     "affinity_multisampling_bootstrap_samples",
+                    "template_options",
+                    "boltz_runtime_options",
                     "use_potentials",
                     "method",
                     "max_msa_seqs",
@@ -3127,6 +3286,7 @@ def run_screening_prediction(
                             binding_pocket_constraints=cp.get("binding_pocket_constraints"),
                             cofactor_info=cofactor_info,
                             template_cif_path=template_cif_path,
+                            template_options=cp.get("template_options", template_options),
                             structure_only=structure_only,
                             ptm_modifications=ptm_modifications,
                             msa_path=job.get("msa_path"),
@@ -3144,6 +3304,7 @@ def run_screening_prediction(
                             devices=batch_command_params.get("devices", devices),
                             cuda_visible_devices=batch_command_params.get("cuda_visible_devices", cuda_visible_devices),
                             preprocessing_threads=batch_command_params.get("preprocessing_threads", preprocessing_threads),
+                            structure_only=structure_only,
                             override=batch_command_params.get("override", not use_existing_results),
                             recycling_steps=batch_command_params.get("recycling_steps", recycling_steps),
                             sampling_steps=batch_command_params.get("sampling_steps", sampling_steps),
@@ -3168,6 +3329,7 @@ def run_screening_prediction(
                                 batch_command_params.get("prediction_timeout_seconds", prediction_timeout_seconds) * max(1, len(remaining_jobs)),
                                 batch_command_params.get("prediction_timeout_seconds", prediction_timeout_seconds),
                             ),
+                            **(batch_command_params.get("boltz_runtime_options") or {}),
                         )
                         batch_elapsed = time.time() - batch_start
                         batch_output_root = os.path.join(project_dir, f"boltz_results_{batch_id}")
@@ -3175,10 +3337,17 @@ def run_screening_prediction(
 
                         for job in remaining_jobs:
                             yaml_name = f"{job['workspace_name']}_{job['design_name']}"
-                            parsed = utils.parse_boltz_results_from_output_root(
-                                batch_output_root,
-                                yaml_name,
-                                structure_only=structure_only,
+                            valid, validation_error = utils.validate_boltz_output_root(
+                                batch_output_root, yaml_name, structure_only=structure_only
+                            )
+                            parsed = (
+                                utils.parse_boltz_results_from_output_root(
+                                    batch_output_root,
+                                    yaml_name,
+                                    structure_only=structure_only,
+                                )
+                                if valid
+                                else None
                             )
                             if parsed:
                                 result = _create_result_entry(
@@ -3201,6 +3370,12 @@ def run_screening_prediction(
                                     boltz_command=batch_cmd,
                                 )
                             else:
+                                if not valid:
+                                    logger.warning(
+                                        "Invalid batch output for %s: %s",
+                                        yaml_name,
+                                        validation_error,
+                                    )
                                 fallback_jobs.append(job)
                     except Exception as exc:
                         st.warning(f"Batch execution failed, falling back to per-job execution: {str(exc)[:180]}")
@@ -3260,6 +3435,7 @@ def run_screening_prediction(
                 subsample_msa=cp.get("subsample_msa", subsample_msa),
                 num_subsampled_msa=cp.get("num_subsampled_msa", num_subsampled_msa),
                 template_cif_path=cp.get("template_cif_path", template_cif_path),
+                template_options=cp.get("template_options", template_options),
                 structure_only=structure_only,
                 ptm_modifications=ptm_modifications,
                 prediction_timeout_seconds=cp.get("prediction_timeout_seconds", prediction_timeout_seconds),
@@ -3269,6 +3445,7 @@ def run_screening_prediction(
                 preprocessing_threads=cp.get("preprocessing_threads", preprocessing_threads),
                 use_potentials=cp.get("use_potentials", False),
                 method=cp.get("method"),
+                boltz_runtime_options=cp.get("boltz_runtime_options", boltz_runtime_options),
                 msa_path=job.get("msa_path"),
                 use_cached_msa=cp.get("use_cached_msa", False),
                 enable_msa_cache=cp.get("enable_msa_cache", enable_msa_cache),
@@ -4114,6 +4291,12 @@ def main():
         elif use_gpu and cuda_visible_devices not in (None, "", "auto") and boltz_devices > 1:
             st.caption("A specific GPU is selected, so each job uses one device.")
             boltz_devices = 1
+        elif use_gpu and not structure_only and boltz_devices > 1:
+            st.caption(
+                "Affinity prediction uses one device per job to avoid Boltz multi-rank cache races. "
+                "Use Multi-GPU Queue mode to run jobs across multiple GPUs."
+            )
+            boltz_devices = 1
 
         preprocessing_threads = st.number_input(
             "Preprocessing Threads",
@@ -4121,6 +4304,38 @@ def main():
             value=max(1, min((os.cpu_count() or 1), 8)),
             help="CPU threads used to prepare inputs. Higher can be faster, but uses more CPU.",
         )
+
+        with st.expander("Boltz 2.2 Runtime", expanded=False):
+            deterministic_run = st.toggle(
+                "Set Reproducibility Seed",
+                value=False,
+                help="Pass a fixed random seed to Boltz so repeated runs are easier to reproduce.",
+            )
+            prediction_seed = None
+            if deterministic_run:
+                prediction_seed = st.number_input(
+                    "Prediction Seed", min_value=0, value=42, step=1
+                )
+            no_kernels = st.toggle(
+                "Disable CUDA Kernels",
+                value=False,
+                help=(
+                    "Use --no_kernels for older NVIDIA GPUs or when optional "
+                    "cuEquivariance kernels cannot load. This is slower."
+                ),
+            )
+            write_full_pae = st.toggle(
+                "Save Full PAE Matrix", value=False,
+                help="Write the full predicted aligned error matrix for downstream analysis.",
+            )
+            write_full_pde = st.toggle(
+                "Save Full PDE Matrix", value=False,
+                help="Write the full predicted distance error matrix for downstream analysis.",
+            )
+            write_embeddings = st.toggle(
+                "Save Model Embeddings", value=False,
+                help="Boltz 2.2: save single and pair embeddings. These files can be large.",
+            )
 
         result_reuse_mode = st.selectbox(
             "Existing Results Policy",
@@ -4155,11 +4370,11 @@ def main():
         recycling_steps = 4
         sampling_steps = 300
         diffusion_samples = 1
-        step_scale = 1.638
+        step_scale = 1.5
         recycling_steps = st.number_input("Recycling Steps", min_value=1, value=4, help="Extra refinement rounds for structure prediction. More rounds may improve quality but take longer.")
         sampling_steps = st.number_input("Sampling Steps", min_value=1, value=300, help="Number of structure sampling steps. More steps are usually more stable but slower.")
         diffusion_samples = st.number_input("Diffusion Samples", min_value=1, value=1, help="How many structure samples to generate per job. More samples improve robustness but increase runtime.")
-        step_scale = st.number_input("Step Scale", value=1.638, format="%.3f", help="Controls exploration vs precision during sampling. Keep default unless you are tuning.")
+        step_scale = st.number_input("Step Scale", value=1.5, min_value=1.0, max_value=2.0, format="%.3f", help="Boltz-2 default is 1.5. Lower values increase sample diversity; the recommended range is 1–2.")
 
         # Affinity Prediction Settings
         st.subheader("Affinity Prediction")
@@ -4201,7 +4416,7 @@ def main():
             )
             affinity_multisampling_enabled = st.toggle(
                 "Enable Affinity Multi-Sampling (Structure Once, Affinity Sweep)",
-                value=True,
+                value=False,
                 help=(
                     "Run structure once, then compute affinity at multiple settings. "
                     "This gives a more robust final score without rerunning structure each time."
@@ -4351,6 +4566,29 @@ def main():
         num_subsampled_msa = 1024
         if subsample_msa:
             num_subsampled_msa = st.number_input("Number of Subsampled MSA Sequences", min_value=1, value=1024, help="Sets the number of MSA sequences to subsample. Lower values increase diversity but may reduce accuracy (recommended: 512-2048).")
+        msa_pairing_strategy = st.selectbox(
+            "MSA Pairing Strategy",
+            options=["greedy", "complete"],
+            index=0,
+            help="Pair sequences across protein chains using Boltz's greedy or complete strategy.",
+        )
+        msa_server_url = st.text_input(
+            "MSA Server URL",
+            value="https://api.colabfold.com",
+            help=(
+                "MMSeqs2-compatible server. Boltz 2.2 authentication can be supplied securely "
+                "with BOLTZ_MSA_USERNAME/BOLTZ_MSA_PASSWORD or MSA_API_KEY_VALUE environment variables."
+            ),
+        )
+        boltz_runtime_options = {
+            "seed": int(prediction_seed) if prediction_seed is not None else None,
+            "no_kernels": bool(no_kernels),
+            "write_full_pae": bool(write_full_pae),
+            "write_full_pde": bool(write_full_pde),
+            "write_embeddings": bool(write_embeddings),
+            "msa_server_url": str(msa_server_url).strip() or None,
+            "msa_pairing_strategy": msa_pairing_strategy,
+        }
 
         # Error handling and retry settings
         st.subheader(":material/error_outline: Error Handling")
@@ -4555,10 +4793,18 @@ def main():
             drug_smiles = []
             
             if protein_input.strip():
-                protein_sequences = parse_fasta_sequences(protein_input)
+                protein_sequences, protein_corrections = parse_fasta_sequences(
+                    protein_input, return_corrections=True
+                )
+                if protein_corrections:
+                    st.info("Protein input auto-corrections: " + "; ".join(protein_corrections) + ".")
             
             if not structure_only and drug_input.strip():
-                drug_smiles = parse_smiles_list(drug_input)
+                drug_smiles, drug_corrections = parse_smiles_list(
+                    drug_input, return_corrections=True
+                )
+                if drug_corrections:
+                    st.info("Drug input auto-corrections: " + "; ".join(drug_corrections) + ".")
         
         else:  # Mutation Mode
             # Mutation mode - wild-type sequence + mutations
@@ -4574,6 +4820,18 @@ def main():
                     label_visibility="collapsed",
                     help="Enter the wild-type protein sequence (single chain or multi-chain with : separator)"
                 )
+                if wt_protein_input.strip():
+                    wt_notes = []
+                    if any(line.strip().startswith(">") for line in wt_protein_input.splitlines()):
+                        wt_notes.append("read and removed the FASTA identifier line")
+                    if re.search(r"\s", wt_protein_input.strip()):
+                        wt_notes.append("removed sequence whitespace/line breaks")
+                    if re.search(r"\d", wt_protein_input):
+                        wt_notes.append("removed pasted residue numbers")
+                    if wt_protein_input.rstrip().endswith("*"):
+                        wt_notes.append("removed the terminal FASTA stop marker (*)")
+                    if wt_notes:
+                        st.info("Wild-type input auto-corrections: " + "; ".join(dict.fromkeys(wt_notes)) + ".")
                 
                 # Residue numbering section
                 # Parse chains to get chain IDs
@@ -4612,6 +4870,13 @@ def main():
                     key="mutations_input",
                     help="Enter mutations in format: <Wild Type Residue><Residue Number><New Residue>. Separate multiple mutants with commas. Combine multiple mutations in one mutant with slashes."
                 )
+                raw_mutations_input = mutations_input
+                mutations_input = re.sub(r"\s+", "", mutations_input.upper())
+                mutations_input = mutations_input.replace(";", ",").replace("-", "/").replace("+", "/")
+                if mutations_input and mutations_input != raw_mutations_input:
+                    st.info(
+                        "Mutation input auto-corrections: normalized case/whitespace and mutation separators."
+                    )
                 
                 # Show mutation format help
                 with st.popover("Mutation Format Help"):
@@ -4661,11 +4926,11 @@ def main():
                         # Create verification data for display
                         verification_data = []
                         # Determine which mutant each verification result belongs to
-                        mutant_strings = [s.strip() for s in st.session_state.get("mutations_input", "").split(',')]
+                        mutant_strings = [s.strip() for s in mutations_input.split(',')]
                         mutant_idx_map = {}
                         for idx, mutant_str in enumerate(mutant_strings):
                             # Each mutant_str can have multiple mutations (split by /)
-                            mutation_parts = [s.strip() for s in mutant_str.split('/')]
+                            mutation_parts = [s.strip() for s in re.split(r"[-/+]", mutant_str)]
                             for part in mutation_parts:
                                 if not part or len(part) < 5:
                                     continue
@@ -4791,6 +5056,9 @@ def main():
                         # Get the mutations for this specific mutant
                         if i < len(mutation_lists):
                             mutations = mutation_lists[i]
+                            if not mutations:
+                                st.error(f"Invalid mutation entry ignored: {mutant_str}")
+                                continue
                             # Apply mutations to sequence
                             mutated_seq = apply_mutations_to_sequence(upper_seq, mutations, chain_starts, chains_dict)
                             protein_sequences.append((mutant_name, mutated_seq))
@@ -4798,7 +5066,11 @@ def main():
                     st.error(f"Invalid wild-type sequence: {error_msg}")
             
             if not structure_only and drug_input.strip():
-                drug_smiles = parse_smiles_list(drug_input)
+                drug_smiles, drug_corrections = parse_smiles_list(
+                    drug_input, return_corrections=True
+                )
+                if drug_corrections:
+                    st.info("Drug input auto-corrections: " + "; ".join(drug_corrections) + ".")
 
     # Advanced options tabs container
     with st.container(border=True):
@@ -5003,18 +5275,24 @@ def main():
         # Tab 2: Structural Template
         with tab2:
             template_cif_path = None
+            template_options: Dict[str, Any] = {}
             col, _ = st.columns([1, 1.5])
             with col:
-                uploaded_cif = st.file_uploader("Upload structural template file", type=["cif"], help="Upload a .cif protein structural file to use as a template for structure prediction.")
-                if uploaded_cif is not None:
+                uploaded_template = st.file_uploader(
+                    "Upload structural template file",
+                    type=["cif", "pdb"],
+                    help="Boltz 2.2 accepts protein templates in mmCIF or PDB format.",
+                )
+                if uploaded_template is not None:
                     if project_name:
                         project_dir = os.path.join(RESULTS_DIR, project_name)
                         os.makedirs(project_dir, exist_ok=True)
-                        cif_filename = f"template_{datetime.now().strftime('%Y%m%d_%H%M%S')}.cif"
-                        cif_path = os.path.join(project_dir, cif_filename)
-                        with open(cif_path, "wb") as f:
-                            f.write(uploaded_cif.read())
-                        template_cif_path = os.path.abspath(cif_path)
+                        suffix = ".pdb" if uploaded_template.name.lower().endswith(".pdb") else ".cif"
+                        template_filename = f"template_{datetime.now().strftime('%Y%m%d_%H%M%S')}{suffix}"
+                        template_path = os.path.join(project_dir, template_filename)
+                        with open(template_path, "wb") as f:
+                            f.write(uploaded_template.read())
+                        template_cif_path = os.path.abspath(template_path)
                         st.session_state["template_cif_path"] = template_cif_path
                     else:
                         st.warning("Please select or create a project before uploading a template file.")
@@ -5023,6 +5301,42 @@ def main():
                     st.session_state["template_cif_path"] = None
                 # For downstream use
                 template_cif_path = st.session_state.get("template_cif_path")
+                if template_cif_path:
+                    force_template = st.toggle(
+                        "Enforce Template Geometry",
+                        value=False,
+                        help="Boltz 2.2 uses a template potential to limit backbone deviation.",
+                    )
+                    template_threshold = st.number_input(
+                        "Template Deviation Threshold (Å)",
+                        min_value=0.1,
+                        value=2.0,
+                        step=0.1,
+                        disabled=not force_template,
+                    )
+                    template_chain_text = st.text_input(
+                        "Target Chain IDs (optional)",
+                        placeholder="A,B",
+                        help="Comma-separated chain IDs in the prediction input.",
+                    )
+                    template_id_text = st.text_input(
+                        "Template Chain IDs (optional)",
+                        placeholder="A1,B1 for PDB templates",
+                        help="Comma-separated source-chain IDs. Provide the same count as Target Chain IDs.",
+                    )
+                    target_ids = [x.strip() for x in template_chain_text.split(",") if x.strip()]
+                    source_ids = [x.strip() for x in template_id_text.split(",") if x.strip()]
+                    if source_ids and len(source_ids) != len(target_ids):
+                        st.warning("Target and template chain mappings must contain the same number of IDs.")
+                        source_ids = []
+                    template_options = {
+                        "force": bool(force_template),
+                        "threshold": float(template_threshold),
+                    }
+                    if target_ids:
+                        template_options["chain_id"] = target_ids[0] if len(target_ids) == 1 else target_ids
+                    if source_ids:
+                        template_options["template_id"] = source_ids[0] if len(source_ids) == 1 else source_ids
 
         # Tab 3: Binding Pocket
         with tab3:
@@ -5088,9 +5402,14 @@ def main():
         "apply_to_wt": bool(mutation_steering_apply_to_wt),
         "mutation_mode_active": input_mode == "Mutation Mode",
         "chain_starts": dict(mutation_chain_starts),
+        "use_potentials": bool(mutation_steering_enable_potentials),
     }
     st.session_state["mutation_steering_config"] = mutation_steering_config
-    use_potentials = bool(mutation_steering_enabled and mutation_steering_enable_potentials)
+    use_potentials = bool(
+        (mutation_steering_enabled and mutation_steering_enable_potentials)
+        or (binding_pocket_constraints or {}).get("force", False)
+        or (template_options or {}).get("force", False)
+    )
     method = method_prior_value if mutation_steering_enabled else None
     
     # Display parsed data
@@ -5127,7 +5446,7 @@ def main():
                                     mutant_name_check = generate_mutant_name_from_text(mutant_str)
                                     if mutant_name_check == name:
                                         # Parse the specific mutations for this mutant
-                                        mutation_parts = [s.strip() for s in mutant_str.split('/')]
+                                        mutation_parts = [s.strip() for s in re.split(r"[-/+]", mutant_str)]
                                         mutant_mutations = []
                                         
                                         for part in mutation_parts:
@@ -5199,7 +5518,7 @@ def main():
                         # For mutation mode, highlight mutations in sequence
                         if input_mode == "Mutation Mode" and name != "WT":
                             # Get mutations input from session state
-                            mutations_input_display = st.session_state.get("mutations_input", "")
+                            mutations_input_display = mutations_input
                             if mutations_input_display:
                                 # Parse mutations for this specific mutant
                                 mutation_lists = parse_mutations(mutations_input_display)
@@ -5535,6 +5854,28 @@ def main():
                         ccd = mod.get('ccd', '')
                         st.write(f"- {protein}, Chain {chain_id}, position {position}: {ccd}")
     
+    form_input_errors: List[str] = []
+    for protein_name, sequence in protein_sequences:
+        sequence_valid, sequence_error, _, _ = validate_protein_sequence(sequence)
+        if not sequence_valid:
+            form_input_errors.append(f"Protein '{protein_name}': {sequence_error}")
+    if not structure_only:
+        for drug_name, smiles in drug_smiles:
+            if not validate_smiles(smiles):
+                form_input_errors.append(f"Drug '{drug_name}' has an invalid SMILES string.")
+    if input_mode == "Mutation Mode":
+        verification = st.session_state.get("mutation_verification_results", [])
+        if any(not item[0] for item in verification):
+            form_input_errors.append("One or more mutations do not match the wild-type residue.")
+        requested_mutants = [item for item in mutations_input.split(",") if item.strip()]
+        parsed_mutants = parse_mutations(mutations_input) if mutations_input.strip() else []
+        if requested_mutants and (
+            len(parsed_mutants) != len(requested_mutants) or any(not item for item in parsed_mutants)
+        ):
+            form_input_errors.append("One or more mutation entries could not be parsed.")
+    if form_input_errors:
+        st.error("Please correct the remaining input errors:\n- " + "\n- ".join(dict.fromkeys(form_input_errors)))
+
     manager = get_job_manager() if USE_SCREENING_JOB_QUEUE else None
     queue_mode_active = USE_SCREENING_JOB_QUEUE and manager is not None
     with st.container():
@@ -5551,10 +5892,20 @@ def main():
             if (queue_mode_active and manager and project_name)
             else None
         )
+        if queue_mode_active:
+            st.caption(
+                "Predictions run in the background while this browser page remains open or is used normally. "
+                "Queued jobs are persisted for recovery after an application restart."
+            )
 
         pad_left, run_col, cancel_col, pad_right = st.columns([1, 2, 2, 1])
         with run_col:
-            disabled = not project_name or not protein_sequences or (not drug_smiles and not structure_only)
+            disabled = (
+                not project_name
+                or not protein_sequences
+                or (not drug_smiles and not structure_only)
+                or bool(form_input_errors)
+            )
             if st.button(
                 "Run Drug Screening",
                 icon=":material/play_circle:",
@@ -5625,6 +5976,8 @@ def main():
                         "subsample_msa": subsample_msa,
                         "num_subsampled_msa": num_subsampled_msa,
                         "template_cif_path": template_cif_path,
+                        "template_options": template_options,
+                        "boltz_runtime_options": boltz_runtime_options,
                         "binding_pocket_constraints": binding_pocket_constraints,
                         "mutation_steering_config": mutation_steering_config,
                         "cofactor_info": cofactor_info,
@@ -5721,11 +6074,13 @@ def main():
                             subsample_msa=subsample_msa,
                             num_subsampled_msa=num_subsampled_msa,
                             template_cif_path=template_cif_path,
+                            template_options=template_options,
                             structure_only=structure_only,
                             ptm_modifications=ptm_modifications,
                             prediction_timeout_seconds=prediction_timeout_minutes * 60,
                             enable_msa_cache=enable_msa_cache,
                             enable_batch_execution=(enable_batch_execution and not affinity_multisampling_enabled),
+                            boltz_runtime_options=boltz_runtime_options,
                         )
                     if results:
                         current_results = st.session_state.get('screening_results', [])
