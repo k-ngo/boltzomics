@@ -26,9 +26,22 @@ from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
-MODULES_DIR = os.path.join(os.path.dirname(__file__), "boltzomics_lib")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+MODULES_DIR = os.path.join(APP_DIR, "boltzomics_lib")
 if MODULES_DIR not in sys.path:
     sys.path.insert(0, MODULES_DIR)
+
+# Results, project folders and Boltz working directories are all addressed with
+# paths relative to the current directory, across several modules. When the app is
+# started from somewhere else (a nohup/systemd launch, for instance) those paths
+# resolve against the wrong root and the UI shows an empty project list while the
+# data sits in another folder. Anchor the process to the app directory instead.
+if os.path.abspath(os.getcwd()) != APP_DIR:
+    try:
+        logger.warning("Changing working directory from %s to %s", os.getcwd(), APP_DIR)
+        os.chdir(APP_DIR)
+    except OSError as exc:
+        logger.error("Could not change working directory to %s: %s", APP_DIR, exc)
 
 
 try:
@@ -131,7 +144,8 @@ from project_management import (
     load_project_data,
     delete_project,
     save_screening_results,
-    rename_results_in_project
+    rename_results_in_project,
+    ensure_project_metadata
 )
 
 # Import visualization functions
@@ -2084,8 +2098,57 @@ def _persist_result_entry(
             print(f"[WARN] {message}")
 
 
+def _create_failure_result_entry(
+    job: "ScreeningJob",
+    error_message: str,
+    computation_time: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Minimal result row recording a job that could not be completed.
+
+    Persisting failures matters for background runs: without a row on disk a
+    project whose jobs all failed leaves nothing but loose Boltz folders, and the
+    user has no way to see what happened after reopening the page.
+    """
+    return {
+        "protein_name": job.protein_name,
+        "drug_name": "" if job.structure_only else job.drug_name,
+        "protein_sequence": job.protein_sequence,
+        "smiles": "" if job.structure_only else job.smiles,
+        "ic50_um": None,
+        "pic50": None,
+        "affinity_probability": None,
+        "confidence": None,
+        "ptm": None,
+        "iptm": None,
+        "avg_plddt": None,
+        "status": "Failed",
+        "error": (error_message or "Unknown error")[:2000],
+        "workspace": job.workspace_name,
+        "design": job.design_name,
+        "timestamp": datetime.now().isoformat(),
+        "computation_time_seconds": computation_time,
+    }
+
+
+def _persist_job_failure(job: "ScreeningJob", error_message: str, computation_time: Optional[float] = None) -> None:
+    """Record a permanently failed job in the project folder."""
+    try:
+        ensure_project_metadata(job.project_name, RESULTS_DIR)
+        _persist_result_entry(
+            job.project_name,
+            _create_failure_result_entry(job, error_message, computation_time),
+            computation_time,
+            log_warning=False,
+        )
+    except Exception as exc:  # never let bookkeeping mask the original failure
+        print(f"[WARN] Could not persist failure for job {job.job_id}: {exc}")
+
+
 def execute_screening_job(job: ScreeningJob, worker_id: int = 0) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     params = job.parameters or {}
+    # Make the project discoverable from the moment work actually starts, not only
+    # once a job succeeds.
+    ensure_project_metadata(job.project_name, RESULTS_DIR)
     ligand_smiles = "" if job.structure_only else job.smiles
     ligand_display_name = "" if job.structure_only else job.drug_name
     yaml_filename = f"{job.workspace_name}_{job.design_name}.yaml"
@@ -2216,19 +2279,26 @@ def execute_screening_job(job: ScreeningJob, worker_id: int = 0) -> Tuple[Dict[s
     return result_entry, metadata
 
 
-def ensure_job_manager_executor(worker_count: int = 1) -> None:
+def ensure_job_manager_executor(worker_count: Optional[int] = None) -> None:
+    """Make sure the shared queue has a live executor and worker pool.
+
+    Called on every render of the screening page, not just when Run is pressed, so
+    jobs recovered from job_state.json after an app restart actually resume.
+    """
     if not USE_SCREENING_JOB_QUEUE:
         return
     manager = get_job_manager()
     if manager is None:
         return
     session_state = getattr(st, "session_state", None)
-    already_registered = bool(session_state is not None and session_state.get(JOB_MANAGER_EXECUTOR_STATE_KEY))
-    if not already_registered:
-        manager.register_executor(execute_screening_job)
-        if session_state is not None:
-            session_state[JOB_MANAGER_EXECUTOR_STATE_KEY] = True
-    manager.set_worker_count(max(1, int(worker_count)))
+    if manager.executor is None or manager.failure_handler is None:
+        manager.register_executor(execute_screening_job, failure_handler=_persist_job_failure)
+    if session_state is not None:
+        session_state[JOB_MANAGER_EXECUTOR_STATE_KEY] = True
+    if worker_count is not None:
+        manager.set_worker_count(max(1, int(worker_count)))
+    else:
+        manager.ensure_workers()
 
 
 def prepare_screening_jobs(
@@ -2403,6 +2473,15 @@ def synchronize_job_results(project_name: str) -> None:
     manager = get_job_manager()
     if manager is None:
         return
+
+    # Flush failures the worker could not record (e.g. jobs that failed under an
+    # older build, or before a failure handler was registered).
+    unrecorded_failures = manager.get_unrecorded_failures(project_name)
+    if unrecorded_failures:
+        for failed_job in unrecorded_failures:
+            _persist_job_failure(failed_job, failed_job.error or "Unknown error")
+        manager.mark_failures_recorded([failed_job.job_id for failed_job in unrecorded_failures])
+
     ready = manager.get_uncommitted_results(project_name)
     if not ready:
         return
@@ -2479,6 +2558,30 @@ def render_job_queue_status(project_name: str) -> Optional[Dict[str, Any]]:
         timing_messages.append(f"ETA {eta_display}")
     if timing_messages:
         st.caption(" • ".join(timing_messages))
+
+    failed_count = summary.get("failed", 0)
+    if failed_count:
+        failed_jobs = [job for job in manager.get_project_jobs(project_name) if job.status == "failed"]
+        first_error = next((job.error for job in failed_jobs if job.error), "")
+        # Surface the reason up front. It used to be reachable only by opening the
+        # collapsed queue table, which is easy to miss after a background run.
+        st.error(
+            f":material/error: {failed_count} job(s) failed after exhausting their retries. "
+            "They are recorded in this project with status 'Failed'."
+        )
+        if first_error:
+            with st.expander("Show failure detail", expanded=False, icon=":material/bug_report:"):
+                st.code(first_error[-4000:])
+        if st.button(
+            f"Retry {failed_count} Failed Job(s)",
+            icon=":material/refresh:",
+            type="secondary",
+            key=f"retry_failed_jobs_{project_name}",
+        ):
+            requeued = manager.retry_failed_jobs(project_name)
+            ensure_job_manager_executor()
+            st.success(f"Requeued {requeued} job(s).")
+            st.rerun()
 
     active_jobs = summary.get("active_jobs") or []
     if active_jobs:
@@ -4704,6 +4807,12 @@ def main():
         with col2:
             if st.button("Delete selected project", icon=":material/delete:", type="tertiary", help="Delete selected project", disabled=not deletion_mode):
                 if project_name and project_name in existing_projects:
+                    # Drop queued work first, otherwise a background worker would
+                    # recreate the folder right after it is removed.
+                    queue_manager = get_job_manager() if USE_SCREENING_JOB_QUEUE else None
+                    if queue_manager is not None:
+                        queue_manager.cancel_project_jobs(project_name)
+                        queue_manager.clear_project_jobs(project_name)
                     if delete_project(project_name, RESULTS_DIR):
                         st.success(f"Deleted project: {project_name}")
                         # Clear session state if this was the loaded project
@@ -5878,6 +5987,11 @@ def main():
 
     manager = get_job_manager() if USE_SCREENING_JOB_QUEUE else None
     queue_mode_active = USE_SCREENING_JOB_QUEUE and manager is not None
+    if queue_mode_active:
+        # Rebind the executor on every render. After an app restart the persisted
+        # queue is reloaded with jobs marked pending, and without this they would
+        # sit there until someone happened to press Run again.
+        ensure_job_manager_executor()
     with st.container():
         filter_state = st.session_state.get('protein_drug_filter')
         total_prediction_jobs = calculate_filtered_job_count(
@@ -6004,6 +6118,10 @@ def main():
                         if manager is None:
                             st.error("Job queue is unavailable. Please try again.")
                         else:
+                            # Make the project visible in the project list right
+                            # away, so a background run is never invisible after a
+                            # page refresh even if every job later fails.
+                            ensure_project_metadata(project_name, RESULTS_DIR)
                             enqueued_jobs = manager.enqueue_jobs(jobs)
                             if enqueued_jobs:
                                 st.success(f"Queued {len(enqueued_jobs)} screening job(s).")

@@ -1,34 +1,180 @@
 import os
 import json
 import shutil
+import tempfile
+import threading
 from datetime import datetime
 from typing import Dict, List, Optional, Union
 import pandas as pd
 import sys
 
+# Directory names inside results_dir that hold app state rather than a project.
+RESERVED_PROJECT_DIR_NAMES = {"_job_state"}
+
+# Serializes read-modify-write cycles on project_metadata.json. Background queue
+# workers finish concurrently, and without this two workers can each read the old
+# metadata and clobber the other's results.
+_METADATA_WRITE_LOCK = threading.RLock()
+
+
+def _atomic_write_json(path: str, payload) -> None:
+    """Write JSON via a temp file + rename so a crash can never leave a truncated
+    project_metadata.json (which would make the whole project unreadable)."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tmp_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f, indent=4, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+def looks_like_project_dir(item_path: str) -> bool:
+    """Heuristically decide whether a folder is a screening project.
+
+    A project is recognized by its metadata file when present, but also by the
+    artifacts a run leaves behind. Runs that crash, are cancelled, or fail every
+    job never get a metadata file written, and requiring one made those projects
+    invisible in the UI even though their data was on disk.
+    """
+    if not os.path.isdir(item_path):
+        return False
+    try:
+        entries = os.listdir(item_path)
+    except OSError:
+        return False
+
+    for entry in entries:
+        if entry == "project_metadata.json":
+            return True
+        if entry.startswith(("screening_results_", "batch_results_")) and entry.endswith(".json"):
+            return True
+        if entry.startswith("boltz_results_") and os.path.isdir(os.path.join(item_path, entry)):
+            return True
+        if entry.startswith(("screening_", "batch_")) and entry.endswith(".yaml"):
+            return True
+    return False
+
+
 def get_project_list(results_dir: str) -> List[str]:
     """
     Get list of existing projects from the specified results directory.
-    
+
     Args:
         results_dir (str): Path to the directory containing project folders
-        
+
     Returns:
-        List[str]: List of project names that contain valid project metadata
+        List[str]: List of project names that hold project metadata or screening artifacts
     """
     if not os.path.exists(results_dir):
         return []
-    
+
     projects = []
-    for item in os.listdir(results_dir):
+    try:
+        entries = os.listdir(results_dir)
+    except OSError:
+        return []
+
+    for item in entries:
+        if item in RESERVED_PROJECT_DIR_NAMES or item.startswith("."):
+            continue
         item_path = os.path.join(results_dir, item)
-        if os.path.isdir(item_path):
-            # Check if it contains project metadata
-            metadata_file = os.path.join(item_path, "project_metadata.json")
-            if os.path.exists(metadata_file):
-                projects.append(item)
-    
+        if looks_like_project_dir(item_path):
+            projects.append(item)
+
     return sorted(projects)
+
+
+def _collect_results_from_files(project_dir: str) -> tuple:
+    """Read every screening_results_*.json in a project folder.
+
+    Returns (results, computation_times).
+    """
+    all_results: List[Dict] = []
+    computation_times: List[float] = []
+    try:
+        entries = os.listdir(project_dir)
+    except OSError:
+        return all_results, computation_times
+
+    results_files = sorted(
+        f for f in entries
+        if f.startswith("screening_results_") and f.endswith(".json")
+    )
+    for results_file in results_files:
+        results_path = os.path.join(project_dir, results_file)
+        try:
+            with open(results_path, 'r') as f:
+                results_data = json.load(f)
+        except Exception as exc:
+            # A single corrupt shard must not hide the rest of the project.
+            print(f"[WARN] Skipping unreadable results file {results_file}: {exc}")
+            continue
+        if isinstance(results_data, list):
+            all_results.extend(results_data)
+        elif isinstance(results_data, dict) and 'results' in results_data:
+            all_results.extend(results_data['results'])
+            if results_data.get('computation_time_seconds'):
+                computation_times.append(results_data['computation_time_seconds'])
+    return all_results, computation_times
+
+
+def _empty_metadata(project_name: str) -> Dict:
+    now = datetime.now().isoformat()
+    return {
+        "project_name": project_name,
+        "created_date": now,
+        "last_updated": now,
+        "total_results": 0,
+        "successful_results": 0,
+        "failed_results": 0,
+        "computation_time_seconds": None,
+        "results": [],
+    }
+
+
+def ensure_project_metadata(project_name: str, results_dir: str) -> Optional[str]:
+    """Create the project folder and a skeleton project_metadata.json if missing.
+
+    Called when a screening run is queued so the project is discoverable in the UI
+    from the moment work starts, rather than only after the first job succeeds.
+    Returns the metadata path, or None on failure.
+    """
+    if not project_name:
+        return None
+    project_dir = os.path.join(results_dir, project_name)
+    metadata_file = os.path.join(project_dir, "project_metadata.json")
+    try:
+        with _METADATA_WRITE_LOCK:
+            os.makedirs(project_dir, exist_ok=True)
+            if os.path.exists(metadata_file):
+                return metadata_file
+            # Reconstruct from any results shards already on disk.
+            existing_results, computation_times = _collect_results_from_files(project_dir)
+            metadata = _empty_metadata(project_name)
+            if existing_results:
+                deduped = deduplicate_results(existing_results)
+                metadata["results"] = deduped
+                metadata["total_results"] = len(deduped)
+                metadata["successful_results"] = len(
+                    [r for r in deduped if isinstance(r, dict) and r.get("status") == "Success"]
+                )
+                metadata["failed_results"] = metadata["total_results"] - metadata["successful_results"]
+                metadata["computation_time_seconds"] = sum(computation_times) if computation_times else None
+            _atomic_write_json(metadata_file, metadata)
+        return metadata_file
+    except Exception as exc:
+        print(f"[WARN] Could not initialize project metadata for {project_name}: {exc}")
+        return None
 
 def load_project_data(project_name: str, results_dir: str) -> Optional[Dict]:
     """
@@ -43,13 +189,27 @@ def load_project_data(project_name: str, results_dir: str) -> Optional[Dict]:
     """
     project_dir = os.path.join(results_dir, project_name)
     metadata_file = os.path.join(project_dir, "project_metadata.json")
-    
-    if not os.path.exists(metadata_file):
+
+    if not os.path.isdir(project_dir):
         return None
-    
+
     try:
-        with open(metadata_file, 'r') as f:
-            metadata = json.load(f)
+        metadata = None
+        if os.path.exists(metadata_file):
+            try:
+                with open(metadata_file, 'r') as f:
+                    metadata = json.load(f)
+            except Exception as exc:
+                # Corrupt or truncated metadata: fall back to rebuilding from the
+                # results shards instead of making the project unopenable.
+                print(f"[WARN] project_metadata.json for {project_name} is unreadable ({exc}); rebuilding from results files.")
+                metadata = None
+
+        if metadata is None:
+            # No usable metadata. The run may have been interrupted, or every job
+            # may have failed before anything was committed. Rebuild what we can so
+            # the project still opens and its artifacts stay reachable.
+            metadata = _empty_metadata(project_name)
 
         # PATCH: If metadata is a list (old format), wrap in dict
         if isinstance(metadata, list):
@@ -67,22 +227,25 @@ def load_project_data(project_name: str, results_dir: str) -> Optional[Dict]:
             }
 
         # Aggregate all screening_results_*.json files
-        results_files = [f for f in os.listdir(project_dir) if f.startswith("screening_results_") and f.endswith(".json")]
-        all_results = []
-        computation_times = []
-        for results_file in results_files:
-            results_path = os.path.join(project_dir, results_file)
-            with open(results_path, 'r') as f:
-                results_data = json.load(f)
-                if isinstance(results_data, list):
-                    all_results.extend(results_data)
-                elif isinstance(results_data, dict) and 'results' in results_data:
-                    all_results.extend(results_data['results'])
-                    if results_data.get('computation_time_seconds'):
-                        computation_times.append(results_data['computation_time_seconds'])
+        all_results, computation_times = _collect_results_from_files(project_dir)
+
+        # Keep results the metadata already carries. Some projects (older batch
+        # runs, or runs whose shards were archived) only have them here, and
+        # dropping them would show an empty project.
+        metadata_results = metadata.get('results') if isinstance(metadata, dict) else None
+        if isinstance(metadata_results, list) and metadata_results:
+            all_results = metadata_results + all_results
+
         # Deduplicate results
         deduped_results = deduplicate_results(all_results)
         metadata['results'] = deduped_results
+        # Keep the summary counters consistent with what we actually loaded, so a
+        # rebuilt project does not report stale totals.
+        metadata['total_results'] = len(deduped_results)
+        metadata['successful_results'] = len(
+            [r for r in deduped_results if isinstance(r, dict) and r.get("status") == "Success"]
+        )
+        metadata['failed_results'] = metadata['total_results'] - metadata['successful_results']
         # Optionally, sum computation times if desired
         metadata['computation_time_seconds'] = sum(computation_times) if computation_times else None
         # --- Load extra fields if present ---
@@ -131,13 +294,32 @@ def deduplicate_results(results: List[Dict]) -> List[Dict]:
     """
     if not results:
         return results
-    
+
+    # Drop anything that is not a dict; a malformed entry in one shard must not
+    # take down the whole project load.
+    results = [r for r in results if isinstance(r, dict)]
+    if not results:
+        return []
+
     # Convert to DataFrame for easier manipulation
     df = pd.DataFrame(results)
-    
-    # Create a composite key for identifying duplicates
-    df['composite_key'] = df['protein_name'] + '|' + df['drug_name']
-    
+
+    # Create a composite key for identifying duplicates. Entries written by the
+    # force-update/recovery path use 'protein'/'drug', so accept those as aliases
+    # and tolerate rows missing the fields entirely.
+    def _key_series(primary: str, alias: str):
+        if primary in df.columns:
+            series = df[primary]
+            if alias in df.columns:
+                series = series.fillna(df[alias])
+        elif alias in df.columns:
+            series = df[alias]
+        else:
+            series = pd.Series([""] * len(df), index=df.index)
+        return series.fillna("").astype(str)
+
+    df['composite_key'] = _key_series('protein_name', 'protein') + '|' + _key_series('drug_name', 'drug')
+
     # Group by composite key and keep the best entry
     deduplicated_results = []
     
@@ -201,31 +383,40 @@ def save_screening_results(results: Union[List[Dict], Dict],
     Returns:
         Optional[str]: Path to saved results file, or None if saving failed
     """
+    # Background queue workers call this concurrently; the metadata update below is
+    # a read-modify-write cycle and must not interleave.
+    _METADATA_WRITE_LOCK.acquire()
     try:
         # Create project directory
         project_dir = os.path.join(results_dir, project_name)
         if not os.path.exists(project_dir):
             os.makedirs(project_dir)
-        
-        # Create filename with timestamp
+
+        # Create filename with timestamp. Seconds resolution is not enough when
+        # several workers finish together, so keep adding a suffix until the name
+        # is free instead of silently overwriting another worker's shard.
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = f"screening_results_{timestamp}.json"
         filepath = os.path.join(project_dir, filename)
-        
+        suffix = 0
+        while os.path.exists(filepath):
+            suffix += 1
+            filename = f"screening_results_{timestamp}_{suffix}.json"
+            filepath = os.path.join(project_dir, filename)
+
         # Extract results list
         results_list = results if isinstance(results, list) else results.get('results', [])
-        
+
         # Add computation time to results metadata
         results_with_metadata = {
             "computation_time_seconds": computation_time,
             "timestamp": timestamp,
             "results": results_list
         }
-        
+
         # Save results
-        with open(filepath, 'w') as f:
-            json.dump(results_with_metadata, f, indent=4, default=str)
-        
+        _atomic_write_json(filepath, results_with_metadata)
+
         # Load existing project metadata if it exists
         metadata_file = os.path.join(project_dir, "project_metadata.json")
         existing_metadata = {}
@@ -271,8 +462,8 @@ def save_screening_results(results: Union[List[Dict], Dict],
             "created_date": existing_metadata.get("created_date", datetime.now().isoformat()),
             "last_updated": datetime.now().isoformat(),
             "total_results": len(deduplicated_results),
-            "successful_results": len([r for r in deduplicated_results if r["status"] == "Success"]),
-            "failed_results": len([r for r in deduplicated_results if r["status"] != "Success"]),
+            "successful_results": len([r for r in deduplicated_results if isinstance(r, dict) and r.get("status") == "Success"]),
+            "failed_results": len([r for r in deduplicated_results if not isinstance(r, dict) or r.get("status") != "Success"]),
             "computation_time_seconds": computation_time,
             "results": deduplicated_results,
             "template_cif_path": template_cif_path if template_cif_path is not None else existing_metadata.get("template_cif_path"),
@@ -287,14 +478,16 @@ def save_screening_results(results: Union[List[Dict], Dict],
             # Set to None if no computation time available (backward compatibility)
             metadata["computation_time_seconds"] = None
         
-        # Save updated metadata
-        with open(metadata_file, 'w') as f:
-            json.dump(metadata, f, indent=4, default=str)
-        
+        # Save updated metadata atomically so an interrupted write cannot leave a
+        # truncated file that makes the project unreadable on the next page load.
+        _atomic_write_json(metadata_file, metadata)
+
         return filepath
     except Exception as e:
         print(f"Error saving results: {str(e)}")
         return None
+    finally:
+        _METADATA_WRITE_LOCK.release()
 
 def rename_results_in_project(project_name: str, old_name: str, new_name: str, rename_type: str, results_dir: str) -> bool:
     """

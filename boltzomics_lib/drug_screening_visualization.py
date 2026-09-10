@@ -357,12 +357,31 @@ def deduplicate_results(results: list[dict]) -> list[dict]:
     """
     if not results:
         return results
-    
+
+    # Drop anything that is not a dict; a malformed entry in one shard must not
+    # take down the whole results view.
+    results = [r for r in results if isinstance(r, dict)]
+    if not results:
+        return []
+
     # Convert to DataFrame for easier manipulation
     df = pd.DataFrame(results)
-    
-    # Create a composite key for identifying duplicates
-    df['composite_key'] = df['protein_name'] + '|' + df['drug_name']
+
+    # Create a composite key for identifying duplicates. Entries written by the
+    # force-update/recovery path use 'protein'/'drug', so accept those as aliases
+    # and tolerate rows missing the fields entirely.
+    def _key_series(primary: str, alias: str):
+        if primary in df.columns:
+            series = df[primary]
+            if alias in df.columns:
+                series = series.fillna(df[alias])
+        elif alias in df.columns:
+            series = df[alias]
+        else:
+            series = pd.Series([""] * len(df), index=df.index)
+        return series.fillna("").astype(str)
+
+    df['composite_key'] = _key_series('protein_name', 'protein') + '|' + _key_series('drug_name', 'drug')
     
     # Group by composite key and keep the best entry
     deduplicated_results = []

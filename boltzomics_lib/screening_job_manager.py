@@ -5,7 +5,7 @@ import os
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Callable
 
 
@@ -33,6 +33,10 @@ class ScreeningJob:
     result: Optional[Dict[str, Any]] = None
     result_metadata: Optional[Dict[str, Any]] = None
     result_committed: bool = False
+    # Epoch seconds before which a requeued job should not be retried.
+    next_attempt_at: Optional[float] = None
+    # Set once a permanent failure has been written to the project folder.
+    failure_recorded: bool = False
 
     def __post_init__(self) -> None:
         self._signature_cache: Optional[str] = None
@@ -93,7 +97,11 @@ class ScreeningJob:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ScreeningJob":
-        return cls(**data)
+        # Tolerate state files written by an older or newer build: drop unknown
+        # keys rather than failing to load (which would silently lose the queue).
+        known = {f.name for f in fields(cls)}
+        filtered = {key: value for key, value in data.items() if key in known}
+        return cls(**filtered)
 
 
 class ScreeningJobManager:
@@ -110,6 +118,7 @@ class ScreeningJobManager:
         self.worker_threads: Dict[int, threading.Thread] = {}
         self.worker_count: int = 1
         self.executor: Optional[Callable[..., Tuple[Dict[str, Any], Dict[str, Any]]]] = None
+        self.failure_handler: Optional[Callable[["ScreeningJob", str], None]] = None
         self._executor_accepts_worker_id: bool = False
         self._load_state()
         self._atexit_registered = False
@@ -133,9 +142,16 @@ class ScreeningJobManager:
     def register_executor(
         self,
         executor: Callable[..., Tuple[Dict[str, Any], Dict[str, Any]]],
+        failure_handler: Optional[Callable[["ScreeningJob", str], None]] = None,
     ) -> None:
-        """Register the callable used to execute jobs."""
+        """Register the callable used to execute jobs.
+
+        ``failure_handler`` is invoked once per job that fails permanently, so the
+        failure can be recorded on disk without a browser session being open.
+        """
         self.executor = executor
+        if failure_handler is not None:
+            self.failure_handler = failure_handler
         try:
             sig = inspect.signature(executor)
             params = list(sig.parameters.values())
@@ -306,6 +322,63 @@ class ScreeningJobManager:
             if updated:
                 self._persist_state_locked()
 
+    def get_unrecorded_failures(self, project_name: Optional[str] = None) -> List[ScreeningJob]:
+        """Permanently failed jobs whose failure was never written to disk.
+
+        Covers jobs that failed before a failure handler was registered (or under
+        an older build), so reopening the app can still surface them.
+        """
+        with self.lock:
+            return [
+                job for job in self.jobs.values()
+                if job.status == "failed"
+                and not job.failure_recorded
+                and (project_name is None or job.project_name == project_name)
+            ]
+
+    def mark_failures_recorded(self, job_ids: Iterable[str]) -> None:
+        with self.lock:
+            updated = False
+            for job_id in job_ids:
+                job = self.jobs.get(job_id)
+                if job and not job.failure_recorded:
+                    job.failure_recorded = True
+                    updated = True
+            if updated:
+                self._persist_state_locked()
+
+    def retry_failed_jobs(self, project_name: str) -> int:
+        """Put every failed job in a project back in the queue."""
+        requeued = 0
+        with self.lock:
+            for job in self.jobs.values():
+                if job.project_name != project_name or job.status != "failed":
+                    continue
+                job.status = "pending"
+                job.retries = 0
+                job.error = None
+                job.started_at = None
+                job.completed_at = None
+                job.next_attempt_at = None
+                job.failure_recorded = False
+                requeued += 1
+            if requeued:
+                self._persist_state_locked()
+        if requeued:
+            self.new_job_event.set()
+            self._ensure_workers()
+        return requeued
+
+    def clear_project_jobs(self, project_name: str) -> int:
+        """Drop all queue entries for a project (used when the project is deleted)."""
+        with self.lock:
+            removed = [job_id for job_id, job in self.jobs.items() if job.project_name == project_name]
+            for job_id in removed:
+                del self.jobs[job_id]
+            if removed:
+                self._persist_state_locked()
+        return len(removed)
+
     def has_job_with_signature(self, signature: str, include_failed: bool = False) -> Optional[ScreeningJob]:
         with self.lock:
             for job in self.jobs.values():
@@ -351,6 +424,10 @@ class ScreeningJobManager:
             if thread and thread.is_alive():
                 thread.join(timeout=5)
 
+    def ensure_workers(self) -> None:
+        """Public entry point: (re)start worker threads that are not running."""
+        self._ensure_workers()
+
     def _ensure_workers(self) -> None:
         target_workers = max(1, int(self.worker_count))
         if self.executor is None:
@@ -380,31 +457,65 @@ class ScreeningJobManager:
                 else:
                     result, metadata = self.executor(job)
             except Exception as exc:
-                with self.lock:
-                    job.retries += 1
-                    job.status = "failed"
-                    job.error = str(exc)
-                    job.completed_at = time.time()
-                    self._persist_state_locked()
+                self._handle_job_failure(job, exc)
                 self.new_job_event.set()
                 continue
             with self.lock:
                 job.status = "success"
                 job.error = None
                 job.completed_at = time.time()
+                job.next_attempt_at = None
                 job.result = result
                 job.result_metadata = metadata
                 self._persist_state_locked()
             self.new_job_event.set()
 
+    def _handle_job_failure(self, job: ScreeningJob, exc: BaseException) -> None:
+        """Requeue a failed job while attempts remain, else mark it failed for good."""
+        error_text = str(exc)
+        with self.lock:
+            job.retries += 1
+            job.error = error_text
+            attempts_remaining = job.retries < max(1, int(job.max_attempts or 1))
+            if attempts_remaining:
+                # Back off so a systemic problem (out of memory, missing model
+                # weights) does not spin the queue at full speed.
+                delay = min(60.0, 5.0 * (2 ** (job.retries - 1)))
+                job.status = "pending"
+                job.started_at = None
+                job.completed_at = None
+                job.next_attempt_at = time.time() + delay
+                notify = None
+            else:
+                job.status = "failed"
+                job.completed_at = time.time()
+                job.next_attempt_at = None
+                notify = None if job.failure_recorded else self.failure_handler
+                if notify is not None:
+                    job.failure_recorded = True
+            self._persist_state_locked()
+
+        if notify is not None:
+            # Called outside the lock: the handler writes to disk and must not
+            # block the queue.
+            try:
+                notify(job, error_text)
+            except Exception as handler_exc:
+                print(f"[WARN] Failure handler raised for job {job.job_id}: {handler_exc}")
+
     def _start_next_job(self) -> Optional[ScreeningJob]:
+        now = time.time()
         with self.lock:
             for job in self.jobs.values():
-                if job.status == "pending":
-                    job.status = "running"
-                    job.started_at = time.time()
-                    self._persist_state_locked()
-                    return job
+                if job.status != "pending":
+                    continue
+                if job.next_attempt_at and job.next_attempt_at > now:
+                    continue  # backing off before the next retry
+                job.status = "running"
+                job.started_at = now
+                job.next_attempt_at = None
+                self._persist_state_locked()
+                return job
         return None
 
     def _load_state(self) -> None:
@@ -426,6 +537,7 @@ class ScreeningJobManager:
                     job.status = "pending"
                     job.started_at = None
                     job.completed_at = None
+                    job.next_attempt_at = None
                     job.error = "Recovered after application restart"
                     recovered_running = True
                 self.jobs[job.job_id] = job
