@@ -381,7 +381,19 @@ def deduplicate_results(results: list[dict]) -> list[dict]:
             series = pd.Series([""] * len(df), index=df.index)
         return series.fillna("").astype(str)
 
-    df['composite_key'] = _key_series('protein_name', 'protein') + '|' + _key_series('drug_name', 'drug')
+    # Prediction replicas are distinct runs of the same pair, so the replica
+    # index is part of the identity. Without it, replicas would be deduplicated
+    # down to a single row and their results would be lost.
+    if 'prediction_replica' in df.columns:
+        replica_series = df['prediction_replica'].fillna(1).astype(str)
+    else:
+        replica_series = pd.Series(['1'] * len(df), index=df.index)
+
+    df['composite_key'] = (
+        _key_series('protein_name', 'protein')
+        + '|' + _key_series('drug_name', 'drug')
+        + '|' + replica_series
+    )
     
     # Group by composite key and keep the best entry
     deduplicated_results = []
@@ -799,7 +811,14 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
         with right_col:
             # pIC50 Heatmap (if possible)
             if len(filtered_df["protein_name"].unique()) > 1 and len(filtered_df["drug_name"].unique()) > 1:
-                pivot_df = filtered_df.pivot(index="protein_name", columns="drug_name", values="pic50")
+                # Replicates give several rows per protein-drug pair; collapse
+                # them with the median so the heatmap stays one cell per pair.
+                pivot_df = filtered_df.pivot_table(
+                    index="protein_name",
+                    columns="drug_name",
+                    values="pic50",
+                    aggfunc="median",
+                )
                 num_proteins = len(pivot_df.index)
                 num_drugs = len(pivot_df.columns)
                 base_height = 400

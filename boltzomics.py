@@ -280,8 +280,9 @@ def _parse_positive_int_list_from_text(raw_text: str) -> List[int]:
             continue
         if value < 1:
             continue
-        if value not in out:
-            out.append(value)
+        # Repeats are kept on purpose: a repeated value is a replicate run of
+        # that setting, and the steps/diffusion lists are positional pairs.
+        out.append(value)
     return out
 
 
@@ -293,7 +294,6 @@ def _parse_affinity_multisampling_profiles_from_text(
         return []
     tokens = re.split(r"[\s,;]+", str(raw_text).strip())
     out: List[Dict[str, int]] = []
-    seen: set = set()
     base_diff = max(1, int(default_diffusion_samples))
     for token in tokens:
         t = str(token).strip()
@@ -314,10 +314,6 @@ def _parse_affinity_multisampling_profiles_from_text(
                 continue
         if diff < 1:
             continue
-        key = (int(step), int(diff))
-        if key in seen:
-            continue
-        seen.add(key)
         out.append(
             {
                 "sampling_steps_affinity": int(step),
@@ -325,6 +321,26 @@ def _parse_affinity_multisampling_profiles_from_text(
             }
         )
     return out
+
+
+def _affinity_profile_labels(profiles: List[Dict[str, int]]) -> List[str]:
+    """Label each sweep profile, disambiguating repeats of the same pair.
+
+    Mirrors ``affinity_multisampling._replicate_profile_label`` so the labels
+    shown in the sidebar match the keys and per-setting files the sweep writes.
+    The first occurrence of a pair keeps the plain ``<steps>x<diffusion>``
+    label; repeats become ``_rep2``, ``_rep3``, ...
+    """
+    counts: Dict[Tuple[int, int], int] = {}
+    labels: List[str] = []
+    for profile in profiles:
+        step = int(profile["sampling_steps_affinity"])
+        diff = int(profile["diffusion_samples_affinity"])
+        key = (step, diff)
+        counts[key] = counts.get(key, 0) + 1
+        base = f"{step}x{diff}"
+        labels.append(base if counts[key] == 1 else f"{base}_rep{counts[key]}")
+    return labels
 
 
 def _auto_diffusion_samples_for_affinity_step(step: int) -> int:
@@ -382,6 +398,8 @@ def _prediction_reproducibility_params(params: Dict[str, Any]) -> Dict[str, Any]
         "cofactor_info",
         "ptm_modifications",
         "structure_only",
+        "prediction_replica",
+        "prediction_replicas",
     ]
     selected: Dict[str, Any] = {}
     for key in relevant_keys:
@@ -398,11 +416,22 @@ def _derive_stable_job_identifiers(
     smiles: str,
     structure_only: bool,
     params: Dict[str, Any],
+    replica_index: int = 1,
+    replica_total: int = 1,
 ) -> Tuple[str, str, str]:
     """
     Build deterministic identifiers for workspace, design, and queue job id.
+
+    When more than one prediction replica is requested, the replica index is
+    folded into both the design name and the hash, so each replica gets its own
+    YAML, its own ``boltz_results_*`` folder and its own queue job. Replicas can
+    therefore never overwrite one another.
     """
     design_name = _sanitize_design_name(protein_name, None if structure_only else drug_name)
+    replica_index = max(1, int(replica_index or 1))
+    replica_total = max(1, int(replica_total or 1))
+    if replica_total > 1:
+        design_name = f"{design_name}_rep{replica_index}"
     signature_payload = {
         "project_name": project_name,
         "protein_name": protein_name,
@@ -410,6 +439,7 @@ def _derive_stable_job_identifiers(
         "drug_name": "" if structure_only else drug_name,
         "smiles": "" if structure_only else smiles,
         "design_name": design_name,
+        "replica_index": replica_index if replica_total > 1 else 1,
         "params": _prediction_reproducibility_params(params),
     }
     normalized = _normalize_for_hash(signature_payload)
@@ -2008,6 +2038,8 @@ def _create_result_entry(
         "status": "Success",
         "workspace": workspace_name,
         "design": design_name,
+        "prediction_replica": int(params.get("prediction_replica", 1) or 1),
+        "prediction_replicas": int(params.get("prediction_replicas", 1) or 1),
         "cofactor_info": params.get("cofactor_info"),
         "boltz2_parameters": {
             "boltz_version": "2.2.1",
@@ -2125,6 +2157,10 @@ def _create_failure_result_entry(
         "error": (error_message or "Unknown error")[:2000],
         "workspace": job.workspace_name,
         "design": job.design_name,
+        # Keep the replica index so a failed replica is recorded on its own row
+        # instead of being deduplicated against its siblings.
+        "prediction_replica": int((job.parameters or {}).get("prediction_replica", 1) or 1),
+        "prediction_replicas": int((job.parameters or {}).get("prediction_replicas", 1) or 1),
         "timestamp": datetime.now().isoformat(),
         "computation_time_seconds": computation_time,
     }
@@ -2329,22 +2365,33 @@ def prepare_screening_jobs(
     )
 
     ordered_protein_sequences = _order_protein_sequences_for_screening(protein_sequences)
+    replica_total = max(1, int(shared_params.get("prediction_replicas", 1) or 1))
 
     for protein_name, protein_seq in ordered_protein_sequences:
         if structure_only:
             if not should_evaluate_protein_drug_pair(protein_name, None, protein_drug_filter):
                 summary["skipped"] += 1
                 continue
-            combos = [("", "")]
+            base_combos = [("", "")]
         else:
-            combos = drug_smiles
+            base_combos = drug_smiles
 
-        for drug_name, drug_smiles_str in combos:
+        # Each replica is an independent job with its own workspace/design, so
+        # replicas of the same pair never share an output folder.
+        combos = [
+            (combo_drug_name, combo_smiles, replica_index)
+            for combo_drug_name, combo_smiles in base_combos
+            for replica_index in range(1, replica_total + 1)
+        ]
+
+        for drug_name, drug_smiles_str, replica_index in combos:
             if not structure_only and not should_evaluate_protein_drug_pair(protein_name, drug_name, protein_drug_filter):
                 summary["skipped"] += 1
                 continue
 
             params = copy.deepcopy(shared_params)
+            params["prediction_replicas"] = replica_total
+            params["prediction_replica"] = replica_index
             params["cofactor_info"] = shared_params.get("cofactor_info")
             params["mutation_steering_config"] = shared_params.get("mutation_steering_config")
             params["binding_pocket_constraints"] = _resolve_mutation_steering_constraints(
@@ -2369,6 +2416,8 @@ def prepare_screening_jobs(
                 smiles="" if structure_only else drug_smiles_str,
                 structure_only=structure_only,
                 params=params,
+                replica_index=replica_index,
+                replica_total=replica_total,
             )
 
             if use_existing_results:
@@ -2377,7 +2426,10 @@ def prepare_screening_jobs(
                     yaml_name=f"{workspace_name}_{design_name}",
                     structure_only=structure_only,
                 )
-                if not existing_yaml_name:
+                # The name-based fallback cannot tell replicas apart, so it would
+                # hand every replica the same cached folder. Only use it when a
+                # single replica was requested.
+                if not existing_yaml_name and replica_total == 1:
                     existing_yaml_name = find_existing_screening_results(protein_name, drug_name, project_name)
                 if existing_yaml_name:
                     project_dir = os.path.join(RESULTS_DIR, project_name)
@@ -2890,16 +2942,18 @@ def run_screening_prediction(
     method: Optional[str] = None,
     boltz_runtime_options: Optional[Dict[str, Any]] = None,
     mutation_steering_config: Optional[Dict[str, Any]] = None,
+    prediction_replicas: int = 1,
 ) -> Tuple[List[Dict], float]:
     """Run screening prediction using Boltz2."""
     results: List[Dict] = []
     protein_drug_filter = st.session_state.get('protein_drug_filter')
+    replica_total = max(1, int(prediction_replicas or 1))
     total_prediction_jobs = calculate_filtered_job_count(
         protein_sequences,
         drug_smiles,
         structure_only,
         protein_drug_filter,
-    )
+    ) * replica_total
 
     if total_prediction_jobs == 0:
         if protein_drug_filter and protein_drug_filter.get('enabled'):
@@ -2943,6 +2997,8 @@ def run_screening_prediction(
             "status": status,
             "workspace": workspace_name,
             "design": design_name,
+            "prediction_replica": int(command_params.get("prediction_replica", 1) or 1),
+            "prediction_replicas": int(command_params.get("prediction_replicas", 1) or 1),
             "cofactor_info": cofactor_info,
             "boltz2_parameters": {
                 "use_gpu": use_gpu,
@@ -3004,8 +3060,15 @@ def run_screening_prediction(
     ordered_protein_sequences = _order_protein_sequences_for_screening(protein_sequences)
 
     for protein_name, protein_seq in ordered_protein_sequences:
-        combos = [("", "")] if structure_only else drug_smiles
-        for drug_name, drug_smiles_str in combos:
+        base_combos = [("", "")] if structure_only else drug_smiles
+        # Replicas are expanded into the combo list so each one runs as its own
+        # job with its own output folder.
+        combos = [
+            (combo_drug_name, combo_smiles, replica_index)
+            for combo_drug_name, combo_smiles in base_combos
+            for replica_index in range(1, replica_total + 1)
+        ]
+        for drug_name, drug_smiles_str, replica_index in combos:
             if structure_only:
                 if not should_evaluate_protein_drug_pair(protein_name, None, protein_drug_filter):
                     continue
@@ -3025,6 +3088,8 @@ def run_screening_prediction(
 
             progress = current_job / total_prediction_jobs
             job_label = protein_name if structure_only else f"{protein_name} + {drug_name}"
+            if replica_total > 1:
+                job_label = f"{job_label} [replica {replica_index}/{replica_total}]"
             progress_bar.progress(progress, text=f"Processing {job_label} ({current_job}/{total_prediction_jobs}) - {eta_text}")
 
             command_params = {
@@ -3090,6 +3155,8 @@ def run_screening_prediction(
                 "structure_only": structure_only,
                 "prediction_timeout_seconds": prediction_timeout_seconds,
                 "enable_msa_cache": enable_msa_cache,
+                "prediction_replicas": replica_total,
+                "prediction_replica": replica_index,
             }
             if wt_sequence_for_msa_cache:
                 command_params["wt_sequence_for_msa_cache"] = wt_sequence_for_msa_cache
@@ -3102,6 +3169,8 @@ def run_screening_prediction(
                 smiles="" if structure_only else drug_smiles_str,
                 structure_only=structure_only,
                 params=command_params,
+                replica_index=replica_index,
+                replica_total=replica_total,
             )
             boltz_results = None
 
@@ -3113,7 +3182,10 @@ def run_screening_prediction(
                         yaml_name=deterministic_yaml_name,
                         structure_only=structure_only,
                     )
-                    if not existing_yaml_name:
+                    # Skip the name-based fallback for multi-replica runs: it
+                    # matches on protein/drug only and would give every replica
+                    # the same cached folder.
+                    if not existing_yaml_name and replica_total == 1:
                         existing_yaml_name = find_existing_screening_results(
                             protein_name,
                             drug_name if not structure_only else "",
@@ -3605,6 +3677,73 @@ def run_screening_prediction(
 
     return results, computation_time
 
+def _render_replicate_summary(df: "pd.DataFrame") -> None:
+    """Show per-pair spread across prediction replicas, when replicas were run.
+
+    Replicas are reported as their own rows; this adds the aggregate view on
+    top, so run-to-run variability is visible without hand-computing it.
+    """
+    if "prediction_replica" not in df.columns:
+        return
+    replica_series = pd.to_numeric(df["prediction_replica"], errors="coerce").fillna(1)
+    if replica_series.max() <= 1:
+        return
+
+    work = df.copy()
+    work["prediction_replica"] = replica_series
+    empty_numeric = pd.Series([None] * len(work), index=work.index, dtype="float64")
+    work["pic50_numeric"] = (
+        pd.to_numeric(work["pic50"], errors="coerce") if "pic50" in work.columns else empty_numeric
+    )
+    work["ic50_numeric"] = (
+        pd.to_numeric(work["ic50_um"], errors="coerce") if "ic50_um" in work.columns else empty_numeric
+    )
+    group_cols = [col for col in ("protein_name", "drug_name") if col in work.columns]
+    if not group_cols:
+        return
+
+    rows = []
+    for keys, group in work.groupby(group_cols, dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        pic50_values = group["pic50_numeric"].dropna()
+        ic50_values = group["ic50_numeric"].dropna()
+        row = dict(zip(group_cols, keys))
+        row.update(
+            {
+                "Replicas": int(group["prediction_replica"].nunique()),
+                "Successful": int((group.get("status") == "Success").sum())
+                if "status" in group.columns
+                else int(len(group)),
+                "pIC50 Median": float(pic50_values.median()) if len(pic50_values) else None,
+                "pIC50 Mean": float(pic50_values.mean()) if len(pic50_values) else None,
+                "pIC50 SD": float(pic50_values.std(ddof=1)) if len(pic50_values) > 1 else None,
+                "pIC50 Range": (
+                    float(pic50_values.max() - pic50_values.min()) if len(pic50_values) > 1 else None
+                ),
+                "IC50 Median (uM)": float(ic50_values.median()) if len(ic50_values) else None,
+            }
+        )
+        rows.append(row)
+
+    if not rows:
+        return
+
+    summary = pd.DataFrame(rows).rename(
+        columns={"protein_name": "Protein", "drug_name": "Drug"}
+    )
+    numeric_cols = [c for c in summary.columns if summary[c].dtype.kind == "f"]
+    summary[numeric_cols] = summary[numeric_cols].round(3)
+
+    st.subheader(":material/repeat: Replicate Summary")
+    st.caption(
+        "Across independent prediction replicas of the same protein-drug pair. "
+        "SD and range show run-to-run variability; individual replicas remain "
+        "listed as separate rows below."
+    )
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+
 def display_results_table(results: List[Dict]):
     """
     Display results in an interactive table with sorting and filtering.
@@ -3724,6 +3863,8 @@ def display_results_table(results: List[Dict]):
     df.loc[:, "ic50_um"] = display_ic50_values
     df.loc[:, "pic50"] = display_pic50_values
     df.loc[:, "affinity_probability"] = display_prob_values
+
+    _render_replicate_summary(df)
     
     # Create summary table with IC50 for each drug and protein combination
     if len(deduplicated_results) > 0:
@@ -3790,8 +3931,15 @@ def display_results_table(results: List[Dict]):
         with col2:
             st.subheader(":material/table_chart: IC50 Summary Table (μM)")
             
-            # Create pivot table for IC50 values
-            summary_df = df.pivot(index="protein_name", columns="drug_name", values="ic50_um")
+            # Create pivot table for IC50 values. Replicates produce several
+            # rows per protein-drug pair, so aggregate them with the median
+            # rather than failing on duplicate index entries.
+            summary_df = df.pivot_table(
+                index="protein_name",
+                columns="drug_name",
+                values="ic50_um",
+                aggfunc="median",
+            )
             # Round values to 4 decimal places for summary table
             summary_df = summary_df.round(4)
             # Gradient highlight: green (min) to red (max) per column
@@ -3846,6 +3994,11 @@ def display_results_table(results: List[Dict]):
         "ptm", "iptm", "avg_plddt",
         "protein_sequence", "smiles", "status"
     ]
+    # Only surface the replica column when replicas were actually run.
+    if "prediction_replica" in df.columns and pd.to_numeric(
+        df["prediction_replica"], errors="coerce"
+    ).fillna(1).max() > 1:
+        column_order.insert(2, "prediction_replica")
     
     # Filter columns that exist in the dataframe
     existing_columns = [col for col in column_order if col in df.columns]
@@ -3866,6 +4019,7 @@ def display_results_table(results: List[Dict]):
         column_config={
             "protein_name": st.column_config.TextColumn("Protein", width="medium"),
             "drug_name": st.column_config.TextColumn("Drug", width="medium"),
+            "prediction_replica": st.column_config.NumberColumn("Replica", format="%d", width="small"),
             "ic50_um": st.column_config.NumberColumn("IC50 (μM)", format="%.4f"),
             "pic50": st.column_config.NumberColumn("pIC50", format="%.3f"),
             "affinity_probability": st.column_config.NumberColumn("Affinity Prob", format="%.3f"),
@@ -4467,6 +4621,29 @@ def main():
             value=5,
             help="How many samples to process at once in a run. Higher can be faster but uses more memory.",
         )
+        prediction_replicas = int(st.number_input(
+            "Prediction Replicas",
+            min_value=1,
+            max_value=20,
+            value=1,
+            step=1,
+            help=(
+                "Independent repeats of every job. Each replica gets its own YAML, its own "
+                "boltz_results folder and its own results row, so replicas never overwrite "
+                "each other. Use more than one to measure run-to-run variability."
+            ),
+        ))
+        if prediction_replicas > 1:
+            st.caption(
+                f"{prediction_replicas} replicas per job: roughly {prediction_replicas}x runtime. "
+                "Outputs are suffixed `_rep1`, `_rep2`, ... and reported as separate rows "
+                "with a replicate summary."
+            )
+            if deterministic_run:
+                st.warning(
+                    "A fixed reproducibility seed is set, so replicas will repeat the same "
+                    "trajectory. Turn the seed off to sample independent replicas."
+                )
 
         # Sampling Settings
         st.subheader("Structure Quality")
@@ -4478,6 +4655,17 @@ def main():
         sampling_steps = st.number_input("Sampling Steps", min_value=1, value=300, help="Number of structure sampling steps. More steps are usually more stable but slower.")
         diffusion_samples = st.number_input("Diffusion Samples", min_value=1, value=1, help="How many structure samples to generate per job. More samples improve robustness but increase runtime.")
         step_scale = st.number_input("Step Scale", value=1.5, min_value=1.0, max_value=2.0, format="%.3f", help="Boltz-2 default is 1.5. Lower values increase sample diversity; the recommended range is 1–2.")
+        use_potentials_setting = st.toggle(
+            "Add Potentials (`--use_potentials`)",
+            value=False,
+            help=(
+                "Boltz inference-time potentials steer diffusion with physical terms "
+                "(sterics, bond geometry, chirality) and enforce any pocket or contact "
+                "constraints. Usually gives more physically plausible poses at the cost of "
+                "extra runtime. Mutation steering and forced constraints turn this on "
+                "automatically."
+            ),
+        )
 
         # Affinity Prediction Settings
         st.subheader("Affinity Prediction")
@@ -4528,13 +4716,21 @@ def main():
 
             if affinity_multisampling_enabled:
                 st.caption(
-                    "Recommended quality mode: run a sweep and use Full Consensus (Median) as the final affinity."
+                    "The structure is predicted once, then the affinity head is re-run at each "
+                    "setting below and the results are combined. Sweeping settings probes how "
+                    "sensitive the score is to sampling effort; repeating the same setting pair "
+                    "probes pure run-to-run noise. Repeats are kept as separate replicates "
+                    "(`300x7`, `300x7_rep2`, ...) and never overwrite each other. "
+                    "Recommended quality mode: sweep, then use Full Consensus (Median) as the "
+                    "final affinity."
                 )
                 affinity_multisampling_steps_text = st.text_input(
                     "Multi Sampling Steps (Affinity)",
                     value="200,300,400",
                     help=(
-                        "Comma-separated affinity step values. Example: 200,300,400."
+                        "Comma-separated affinity step values. Example: 200,300,400. "
+                        "Repeat a value to run it more than once, e.g. 300,300,300 for three "
+                        "replicates at the same setting."
                     ),
                 )
                 affinity_multisampling_steps = _parse_positive_int_list_from_text(
@@ -4605,21 +4801,28 @@ def main():
                 affinity_multisampling_refinement_steps = [
                     int(profile["sampling_steps_affinity"]) for profile in affinity_multisampling_profiles
                 ]
-                affinity_multisampling_settings = [
-                    f"{int(profile['sampling_steps_affinity'])}x{int(profile['diffusion_samples_affinity'])}"
-                    for profile in affinity_multisampling_profiles
-                ]
+                affinity_multisampling_settings = _affinity_profile_labels(
+                    affinity_multisampling_profiles
+                )
                 sampling_steps_affinity = int(affinity_multisampling_profiles[0]["sampling_steps_affinity"])
                 diffusion_samples_affinity = int(affinity_multisampling_profiles[0]["diffusion_samples_affinity"])
                 st.caption(
-                    "Multi-sampling profiles: "
-                    + ", ".join(
-                        [
-                            f"{int(p['sampling_steps_affinity'])}:{int(p['diffusion_samples_affinity'])}"
-                            for p in affinity_multisampling_profiles
-                        ]
-                    )
+                    "Multi-sampling profiles: " + ", ".join(affinity_multisampling_settings)
                 )
+                _duplicate_setting_count = len(affinity_multisampling_settings) - len(
+                    {
+                        (
+                            int(p["sampling_steps_affinity"]),
+                            int(p["diffusion_samples_affinity"]),
+                        )
+                        for p in affinity_multisampling_profiles
+                    }
+                )
+                if _duplicate_setting_count > 0:
+                    st.caption(
+                        f"{_duplicate_setting_count} repeated setting pair(s) will run as "
+                        "independent replicates with their own `_rep` outputs."
+                    )
             else:
                 sampling_steps_affinity = st.number_input(
                     "Sampling Steps (Affinity)",
@@ -5515,7 +5718,8 @@ def main():
     }
     st.session_state["mutation_steering_config"] = mutation_steering_config
     use_potentials = bool(
-        (mutation_steering_enabled and mutation_steering_enable_potentials)
+        use_potentials_setting
+        or (mutation_steering_enabled and mutation_steering_enable_potentials)
         or (binding_pocket_constraints or {}).get("force", False)
         or (template_options or {}).get("force", False)
     )
@@ -5914,6 +6118,16 @@ def main():
                     st.write(f"- {example_residues}")
                 st.write(f" - Max distance: {max_distance} Å")
 
+            st.write("**:material/tune: Sampling setup:**")
+            st.write(
+                f"- Boltz potentials (`--use_potentials`): {'Enabled' if use_potentials else 'Disabled'}"
+            )
+            if prediction_replicas > 1:
+                st.write(
+                    f"- Prediction replicas: {prediction_replicas} per job "
+                    "(separate output folders and result rows)"
+                )
+
             steering_cfg = st.session_state.get("mutation_steering_config", {})
             if steering_cfg.get("enabled"):
                 st.write("**:material/biotech: Mutation-conditioned steering:**")
@@ -5927,14 +6141,19 @@ def main():
                 st.write("**:material/sync_alt: Affinity prediction setup:**")
                 if affinity_multisampling_enabled:
                     st.write("- Multi-sampling is ON (one structure run, then multiple affinity passes).")
-                    profile_text = ", ".join(
-                        f"{int(p['sampling_steps_affinity'])}:{int(p['diffusion_samples_affinity'])}"
-                        for p in (affinity_multisampling_profiles or [])
-                    )
+                    profile_text = ", ".join(affinity_multisampling_settings or [])
                     st.write(
-                        f"- Settings tested (steps:diffusion): "
-                        f"{profile_text or f'{int(sampling_steps_affinity)}:{int(diffusion_samples_affinity)}'}"
+                        f"- Settings tested (steps x diffusion): "
+                        f"{profile_text or f'{int(sampling_steps_affinity)}x{int(diffusion_samples_affinity)}'}"
                     )
+                    _repeat_labels = [
+                        label for label in (affinity_multisampling_settings or []) if "_rep" in label
+                    ]
+                    if _repeat_labels:
+                        st.write(
+                            f"- Repeated settings run as independent replicates: "
+                            f"{', '.join(_repeat_labels)}"
+                        )
                     if affinity_multisampling_apply_aggregate:
                         st.write(
                             f"- Final reported affinity: {str(affinity_multisampling_aggregate_mode).replace('_', ' ')} across tested settings"
@@ -5994,12 +6213,19 @@ def main():
         ensure_job_manager_executor()
     with st.container():
         filter_state = st.session_state.get('protein_drug_filter')
-        total_prediction_jobs = calculate_filtered_job_count(
-            protein_sequences,
-            drug_smiles,
-            structure_only,
-            filter_state,
+        total_prediction_jobs = (
+            calculate_filtered_job_count(
+                protein_sequences,
+                drug_smiles,
+                structure_only,
+                filter_state,
+            ) * max(1, int(prediction_replicas))
         ) if (protein_sequences and (drug_smiles or structure_only)) else 0
+        if total_prediction_jobs and prediction_replicas > 1:
+            st.caption(
+                f"{total_prediction_jobs} runs queued: "
+                f"{total_prediction_jobs // prediction_replicas} pair(s) x {prediction_replicas} replicas."
+            )
 
         queue_summary_for_controls = (
             manager.get_project_summary(project_name)
@@ -6098,6 +6324,7 @@ def main():
                         "ptm_modifications": ptm_modifications,
                         "prediction_timeout_seconds": prediction_timeout_minutes * 60,
                         "enable_msa_cache": enable_msa_cache,
+                        "prediction_replicas": prediction_replicas,
                     }
                     jobs, cached_results, job_summary = prepare_screening_jobs(
                         protein_sequences=protein_sequences,
@@ -6199,6 +6426,7 @@ def main():
                             enable_msa_cache=enable_msa_cache,
                             enable_batch_execution=(enable_batch_execution and not affinity_multisampling_enabled),
                             boltz_runtime_options=boltz_runtime_options,
+                            prediction_replicas=prediction_replicas,
                         )
                     if results:
                         current_results = st.session_state.get('screening_results', [])

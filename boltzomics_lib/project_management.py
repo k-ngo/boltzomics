@@ -318,7 +318,19 @@ def deduplicate_results(results: List[Dict]) -> List[Dict]:
             series = pd.Series([""] * len(df), index=df.index)
         return series.fillna("").astype(str)
 
-    df['composite_key'] = _key_series('protein_name', 'protein') + '|' + _key_series('drug_name', 'drug')
+    # Prediction replicas are distinct runs of the same pair, so the replica
+    # index is part of the identity. Without it, replicas written to the project
+    # metadata would be collapsed to a single surviving row.
+    if 'prediction_replica' in df.columns:
+        replica_series = df['prediction_replica'].fillna(1).astype(str)
+    else:
+        replica_series = pd.Series(['1'] * len(df), index=df.index)
+
+    df['composite_key'] = (
+        _key_series('protein_name', 'protein')
+        + '|' + _key_series('drug_name', 'drug')
+        + '|' + replica_series
+    )
 
     # Group by composite key and keep the best entry
     deduplicated_results = []

@@ -50,6 +50,12 @@ def _safe_int(value: Any) -> Optional[int]:
 
 
 def _normalize_refinement_steps(values: Optional[Iterable[Any]]) -> List[int]:
+    """Normalize refinement steps, preserving repeats.
+
+    Repeated step values are intentionally kept: a repeated setting is a
+    replicate run of that setting, which is how run-to-run variance is
+    estimated. Deduplicating here would silently drop those replicates.
+    """
     if not values:
         return []
     out: List[int] = []
@@ -57,13 +63,29 @@ def _normalize_refinement_steps(values: Optional[Iterable[Any]]) -> List[int]:
         step = _safe_int(value)
         if step is None or step < 1:
             continue
-        if step not in out:
-            out.append(step)
+        out.append(step)
     return out
 
 
 def _profile_label(sampling_steps_affinity: int, diffusion_samples_affinity: int) -> str:
     return f"{int(sampling_steps_affinity)}x{int(diffusion_samples_affinity)}"
+
+
+def _replicate_profile_label(
+    sampling_steps_affinity: int,
+    diffusion_samples_affinity: int,
+    replicate_index: int,
+) -> str:
+    """Label a sweep profile, disambiguating repeats of the same setting pair.
+
+    The first occurrence of a pair keeps the plain ``<steps>x<diffusion>`` label
+    for backward compatibility; repeats get ``_rep2``, ``_rep3``, ... so their
+    per-setting JSON files and result keys never collide.
+    """
+    base = _profile_label(sampling_steps_affinity, diffusion_samples_affinity)
+    if int(replicate_index) <= 1:
+        return base
+    return f"{base}_rep{int(replicate_index)}"
 
 
 def _normalize_profile_list(
@@ -73,7 +95,9 @@ def _normalize_profile_list(
     if not values:
         return []
     out: List[Dict[str, int]] = []
-    seen: set = set()
+    # Count how often each (step, diffusion) pair was requested so repeats become
+    # distinct replicate labels instead of overwriting one another.
+    seen: Dict[Tuple[int, int], int] = {}
     base_diff = max(1, int(diffusion_samples_affinity_base))
     for value in values:
         step: Optional[int] = None
@@ -105,14 +129,14 @@ def _normalize_profile_list(
             diff = base_diff
 
         key = (int(step), int(diff))
-        if key in seen:
-            continue
-        seen.add(key)
+        replicate_index = seen.get(key, 0) + 1
+        seen[key] = replicate_index
         out.append(
             {
-                "label": _profile_label(step, diff),
+                "label": _replicate_profile_label(step, diff, replicate_index),
                 "sampling_steps_affinity": int(step),
                 "diffusion_samples_affinity": int(diff),
+                "replicate_index": int(replicate_index),
             }
         )
     return out
@@ -135,14 +159,12 @@ def _build_sweep_profiles(
     # Preferred path: explicit ordered numeric refinement steps from user.
     custom_steps = _normalize_refinement_steps(refinement_steps)
     if custom_steps:
-        return [
-            {
-                "label": _profile_label(step, int(diffusion_samples_affinity_base)),
-                "sampling_steps_affinity": int(step),
-                "diffusion_samples_affinity": int(diffusion_samples_affinity_base),
-            }
-            for step in custom_steps
-        ]
+        # Route through the profile normalizer so repeated steps get replicate
+        # labels rather than colliding on one key.
+        return _normalize_profile_list(
+            [(int(step), int(diffusion_samples_affinity_base)) for step in custom_steps],
+            diffusion_samples_affinity_base=int(diffusion_samples_affinity_base),
+        )
 
     # Default: single-profile sweep using current affinity configuration.
     return [
