@@ -39,6 +39,56 @@ CONFIDENCE_HELP_TEXT = (
     "Confidence = 0.8 x pLDDT + 0.2 x ipTM. "
     "For this formula, pLDDT is normalized to 0-1 (displayed Avg pLDDT is 0-100)."
 )
+PDB_DOWNLOADS_PER_ARCHIVE = 80
+
+
+def _safe_archive_component(value):
+    """Return a filesystem-safe filename component with a useful fallback."""
+    cleaned = "".join(c for c in str(value or "") if c.isalnum() or c in (" ", "-", "_", ".")).strip(" .")
+    return cleaned or "structure"
+
+
+def _build_pdb_download_archives(poses, project_name):
+    """Build numbered ZIP archives so large structure collections stay downloadable."""
+    available = []
+    for pose in poses:
+        pdb_path = pose.get("pdb_filepath") or pose.get("pdb_path")
+        if not pdb_path or not os.path.isfile(pdb_path):
+            continue
+
+        protein = _safe_archive_component(pose.get("protein_name"))
+        drug = pose.get("drug_name")
+        if drug:
+            pic50 = pose.get("pic50")
+            score = f"_pIC50_{float(pic50):.2f}" if pic50 is not None else ""
+            stem = f"{protein}_{_safe_archive_component(drug)}{score}"
+        else:
+            stem = protein
+
+        # Include prediction identifiers so repeated protein/drug labels do not
+        # produce duplicate ZIP paths or overwrite each other on extraction.
+        identity = "_".join(
+            _safe_archive_component(pose.get(key))
+            for key in ("workspace", "design")
+            if pose.get(key)
+        )
+        if identity:
+            stem = f"{stem}_{identity}"
+        available.append((pdb_path, f"{stem}.pdb"))
+
+    archives = []
+    total = len(available)
+    for offset in range(0, total, PDB_DOWNLOADS_PER_ARCHIVE):
+        chunk = available[offset:offset + PDB_DOWNLOADS_PER_ARCHIVE]
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zip_file:
+            for pdb_path, archive_name in chunk:
+                zip_file.write(pdb_path, archive_name)
+        part = offset // PDB_DOWNLOADS_PER_ARCHIVE + 1
+        part_count = (total + PDB_DOWNLOADS_PER_ARCHIVE - 1) // PDB_DOWNLOADS_PER_ARCHIVE
+        zip_filename = f"{_safe_archive_component(project_name)}_structures_part_{part:03d}_of_{part_count:03d}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        archives.append((offset + 1, offset + len(chunk), total, zip_filename, zip_buffer.getvalue()))
+    return archives
 
 
 def find_screening_boltz_structure_file(workspace_name, design_name, project_name):
@@ -1288,29 +1338,30 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                         )
                 with controls_right:
                     if len(available_poses) > 1:
-                        zip_buffer = io.BytesIO()
-                        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                            added_files = 0
-                            for pose in available_poses:
-                                pdb_path = find_batch_boltz_structure_file(pose['workspace'], pose['design'], project_name)
-                                if pdb_path and os.path.exists(pdb_path):
-                                    safe_protein = "".join(c for c in pose['protein_name'] if c.isalnum() or c in (' ', '-', '_')).rstrip()
-                                    safe_drug = "".join(c for c in pose['drug_name'] if c.isalnum() or c in (' ', '-', '_')).rstrip()
-                                    zip_filename = f"{safe_protein}_{safe_drug}_pIC50_{pose['pic50']:.2f}.pdb"
-                                    zip_file.write(pdb_path, zip_filename)
-                                    added_files += 1
-
-                        if added_files > 0:
-                            zip_buffer.seek(0)
-                            zip_filename = f"{project_name}_all_pdbs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-                            st.download_button(
-                                label="Download All PDBs",
-                                data=zip_buffer.getvalue(),
-                                file_name=zip_filename,
-                                mime="application/zip",
-                                key="download_all_pdbs_zip",
-                                use_container_width=True,
+                        export_poses = [
+                            {
+                                **pose,
+                                "pdb_filepath": find_batch_boltz_structure_file(
+                                    pose["workspace"], pose["design"], project_name
+                                ),
+                            }
+                            for pose in available_poses
+                        ]
+                        archives = _build_pdb_download_archives(export_poses, project_name)
+                        if archives:
+                            st.caption(
+                                f"{archives[0][2]} structures available. Download all numbered parts "
+                                f"({PDB_DOWNLOADS_PER_ARCHIVE} structures per part)."
                             )
+                            for first, last, total, zip_filename, zip_data in archives:
+                                st.download_button(
+                                    label=f"Download PDBs {first}–{last} of {total}",
+                                    data=zip_data,
+                                    file_name=zip_filename,
+                                    mime="application/zip",
+                                    key=f"download_all_pdbs_zip_{first}_{last}",
+                                    use_container_width=True,
+                                )
             else:
                 st.info("Select a pose from the dropdown to view the 3D structure.")
 
@@ -1807,30 +1858,23 @@ def display_structure_only_3d_viewer(results, project_name):
                 model_name=f"{selected_pose['workspace']}_{selected_pose['design']}",
                 height=900,
             )
-    # Download all PDBs as zip
+    # Download all PDBs in numbered archives to keep each download manageable.
     if len(available_poses) > 1:
-        import io, zipfile
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            added_files = 0
-            for pose in available_poses:
-                pdb_path = pose['pdb_filepath']
-                if pdb_path and os.path.exists(pdb_path):
-                    safe_protein = "".join(c for c in pose['protein_name'] if c.isalnum() or c in (' ', '-', '_')).rstrip()
-                    zip_filename = f"{safe_protein}.pdb"
-                    zip_file.write(pdb_path, zip_filename)
-                    added_files += 1
-        if added_files > 0:
-            zip_buffer.seek(0)
-            zip_filename = f"{project_name}_all_pdbs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-            st.download_button(
-                label="Download All PDBs",
-                data=zip_buffer.getvalue(),
-                file_name=zip_filename,
-                mime="application/zip",
-                key="download_all_pdbs_zip_structure_only",
-                icon=":material/archive:",
-                use_container_width=True
+        archives = _build_pdb_download_archives(available_poses, project_name)
+        if archives:
+            st.caption(
+                f"{archives[0][2]} structures available. Download all numbered parts "
+                f"({PDB_DOWNLOADS_PER_ARCHIVE} structures per part)."
             )
+            for first, last, total, zip_filename, zip_data in archives:
+                st.download_button(
+                    label=f"Download PDBs {first}–{last} of {total}",
+                    data=zip_data,
+                    file_name=zip_filename,
+                    mime="application/zip",
+                    key=f"download_all_pdbs_zip_structure_only_{first}_{last}",
+                    icon=":material/archive:",
+                    use_container_width=True,
+                )
         else:
             st.error("No PDB files found to download.")
