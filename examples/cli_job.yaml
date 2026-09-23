@@ -1,0 +1,24 @@
+project_name: lysozyme_cli_demo
+structure_only: false
+gpu_mode: auto
+proteins:
+  fasta_file: cli_proteins.fasta
+ligands:
+  csv_file: cli_ligands.csv
+  name_column: name
+  smiles_column: smiles
+use_existing_results: true
+settings:
+  use_gpu: true
+  accelerator: gpu
+  devices: 1
+  preprocessing_threads: 1
+  recycling_steps: 4
+  sampling_steps: 200
+  diffusion_samples: 1
+  max_parallel_samples: 5
+  step_scale: 1.5
+  enable_msa_cache: true
+  enable_retries: true
+  max_retry_attempts: 2
+  prediction_timeout_seconds: 1200

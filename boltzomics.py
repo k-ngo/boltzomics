@@ -2327,14 +2327,33 @@ def ensure_job_manager_executor(worker_count: Optional[int] = None) -> None:
     if manager is None:
         return
     session_state = getattr(st, "session_state", None)
+    desired_worker_count = max(1, int(worker_count)) if worker_count is not None else None
+    if desired_worker_count is None:
+        # A recovered queue retains each job's GPU assignment but the worker
+        # count is process-local. Rebuild the pool width from pending jobs so
+        # Auto mode continues to use every assigned GPU after an app restart.
+        with manager.lock:
+            pending_jobs = [job for job in manager.jobs.values() if job.status in {"pending", "running"}]
+        assigned_gpu_counts = [
+            len(job.parameters.get("queue_gpu_devices") or [])
+            for job in pending_jobs
+            if (job.parameters or {}).get("accelerator", "gpu") == "gpu"
+            and (job.parameters or {}).get("use_gpu", True)
+            and isinstance((job.parameters or {}).get("queue_gpu_devices"), list)
+        ]
+        if assigned_gpu_counts:
+            desired_worker_count = max(1, max(assigned_gpu_counts))
+
+    # Set the pool width before registering a fresh executor, so a recovered
+    # queue does not start one job on GPU 0 before the other workers exist.
+    if desired_worker_count is not None:
+        manager.set_worker_count(desired_worker_count)
     if manager.executor is None or manager.failure_handler is None:
         manager.register_executor(execute_screening_job, failure_handler=_persist_job_failure)
+    elif desired_worker_count is None:
+        manager.ensure_workers()
     if session_state is not None:
         session_state[JOB_MANAGER_EXECUTOR_STATE_KEY] = True
-    if worker_count is not None:
-        manager.set_worker_count(max(1, int(worker_count)))
-    else:
-        manager.ensure_workers()
 
 
 def prepare_screening_jobs(
@@ -4492,17 +4511,27 @@ def main():
                 gpu_execution_mode = st.selectbox(
                     "GPU Usage Mode",
                     options=[
+                        "Auto (Distribute Across All GPUs)",
                         "Single GPU",
-                        "Multi-GPU Queue (One Job per GPU)",
+                        "Multi-GPU Queue (Manual Selection)",
                     ],
                     index=0,
                     help=(
-                        "Single GPU: run one job at a time on one GPU. "
-                        "Multi-GPU Queue: run multiple jobs in parallel, one per selected GPU."
+                        "Auto distributes screening jobs across every detected GPU. "
+                        "Single GPU runs one job at a time. Manual queue mode lets you choose GPUs."
                     ),
                 )
             gpu_labels = [f"GPU {idx}: {name}" for idx, name in available_gpus]
-            if gpu_execution_mode.startswith("Multi-GPU"):
+            if gpu_execution_mode.startswith("Auto"):
+                queue_gpu_devices = [str(idx) for idx, _name in available_gpus]
+                queue_worker_count = max(1, len(queue_gpu_devices))
+                if queue_gpu_devices:
+                    cuda_visible_devices = queue_gpu_devices[0]
+                st.caption(
+                    f"Auto mode will run up to {queue_worker_count} jobs at once, "
+                    "assigning one job to each detected GPU."
+                )
+            elif gpu_execution_mode.startswith("Multi-GPU"):
                 default_labels = gpu_labels if gpu_labels else []
                 selected_gpu_labels = st.multiselect(
                     "GPUs to Use",
@@ -4542,9 +4571,9 @@ def main():
             value=1,
             help="How many devices each single Boltz run can use.",
         )
-        if gpu_execution_mode.startswith("Multi-GPU"):
+        if gpu_execution_mode.startswith(("Auto", "Multi-GPU")):
             boltz_devices = 1
-            st.caption("Multi-GPU queue mode runs one job per GPU.")
+            st.caption("GPU queue mode runs one prediction job per selected GPU.")
         elif use_gpu and cuda_visible_devices not in (None, "", "auto") and boltz_devices > 1:
             st.caption("A specific GPU is selected, so each job uses one device.")
             boltz_devices = 1
@@ -6221,6 +6250,13 @@ def main():
                 filter_state,
             ) * max(1, int(prediction_replicas))
         ) if (protein_sequences and (drug_smiles or structure_only)) else 0
+        if gpu_execution_mode.startswith("Auto") and total_prediction_jobs:
+            active_gpu_count = min(total_prediction_jobs, len(queue_gpu_devices))
+            if active_gpu_count < len(queue_gpu_devices):
+                st.caption(
+                    f"This input has {total_prediction_jobs} job(s), so up to "
+                    f"{active_gpu_count} of {len(queue_gpu_devices)} GPUs can run at once."
+                )
         if total_prediction_jobs and prediction_replicas > 1:
             st.caption(
                 f"{total_prediction_jobs} runs queued: "
@@ -6272,7 +6308,11 @@ def main():
                         "accelerator": accelerator,
                         "devices": boltz_devices,
                         "cuda_visible_devices": cuda_visible_devices,
-                        "queue_gpu_devices": queue_gpu_devices if gpu_execution_mode.startswith("Multi-GPU") else None,
+                        "queue_gpu_devices": (
+                            queue_gpu_devices
+                            if gpu_execution_mode.startswith(("Auto", "Multi-GPU"))
+                            else None
+                        ),
                         "preprocessing_threads": preprocessing_threads,
                         "override": not use_existing_results,
                         "recycling_steps": recycling_steps,
