@@ -226,3 +226,147 @@ A: It is recommended for screening and for any case where you want to know wheth
 
 **Q: When should I run post-prediction relaxation?**  
 A: Use it when local strain or clashes are suspected, or when you want a cleaner structure for visualization and interaction inspection.
+
+---
+# BoltzOmics command-line guide
+
+Run BoltzOmics screenings from a YAML or JSON manifest without opening the Streamlit interface. The CLI reads protein sequences and ligand SMILES from files or directly from the manifest, then saves results in the same project folders used by the app.
+
+## 1. Set up BoltzOmics
+
+Follow the [README installation steps](README.md#setup-and-installation), activate the BoltzOmics environment, and run commands from the repository folder. Check the available commands with:
+
+```bash
+python boltzomics_cli.py --help
+```
+
+## 2. Prepare your inputs
+
+Start with [examples/cli_job.yaml](examples/cli_job.yaml). It references [a protein FASTA file](examples/cli_proteins.fasta) and [a ligand CSV file](examples/cli_ligands.csv). Paths in a manifest are relative to the manifest itself.
+
+The ligand CSV needs a header row with a name column and a SMILES column. For example:
+
+```csv
+name,smiles
+Aspirin,CC(=O)Oc1ccccc1C(=O)O
+Caffeine,Cn1c(=O)c2c(ncn2C)n(C)c1=O
+```
+
+You can also put proteins and ligands directly in the manifest:
+
+```yaml
+project_name: small_screen
+proteins:
+  - name: WT
+    sequence: MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQANL
+  - name: R10K
+    sequence: MKTAYIAKQKQISFVKSHFSRQLEERLGLIEVQANL
+ligands:
+  - name: compound_a
+    smiles: CCO
+```
+
+To run without ligands, set `structure_only: true` and omit `ligands`.
+
+## 3. Run a screening
+
+Submit the example manifest and wait for the CLI queue to finish:
+
+```bash
+python boltzomics_cli.py run examples/cli_job.yaml
+```
+
+The command prints a JSON summary and returns a nonzero exit code if a job in the manifest's project fails. Existing valid results are reused by default; set `use_existing_results: false` in the manifest to run them again.
+
+## GPU options
+
+`gpu_mode: auto` is the default. When multiple GPUs are detected, jobs are distributed across them, one job per GPU. The worker count defaults to the number of assigned GPUs and can be changed with the top-level `workers` setting or the `--workers` command option.
+
+To choose GPUs yourself, add this to the manifest:
+
+```yaml
+gpu_mode: auto
+workers: 2
+settings:
+  queue_gpu_devices: ["0", "1"]
+```
+
+Set `gpu_mode: single` and `workers: 1` to run one job at a time on one GPU. For CPU execution, set both `settings.accelerator: cpu` and `settings.use_gpu: false`.
+
+## Run jobs with a separate worker
+
+Use `submit` to add jobs to the persistent CLI queue without starting predictions:
+
+```bash
+python boltzomics_cli.py submit examples/cli_job.yaml
+```
+
+Start the worker in a terminal. It processes queued jobs and exits when the queue is empty:
+
+```bash
+python boltzomics_cli.py worker
+```
+
+While the worker runs, use another terminal to check progress or wait for a project to finish:
+
+```bash
+python boltzomics_cli.py status --project lysozyme_cli_demo
+python boltzomics_cli.py wait --project lysozyme_cli_demo
+```
+
+Submit all manifests before starting the worker. Wait for it to exit before running queue-changing commands such as `submit`, `retry`, or `cancel`. The CLI queue is separate from the Streamlit queue, but both write results to the same project folder.
+
+## Manage jobs and export results
+
+Retry failed jobs, then start a worker to run them again:
+
+```bash
+python boltzomics_cli.py retry --project lysozyme_cli_demo
+python boltzomics_cli.py worker
+```
+
+Cancel removes pending jobs; it does not stop a prediction that is already running:
+
+```bash
+python boltzomics_cli.py cancel --project lysozyme_cli_demo
+```
+
+Export project results as CSV or JSON:
+
+```bash
+python boltzomics_cli.py results --project lysozyme_cli_demo --format csv --output results.csv
+python boltzomics_cli.py results --project lysozyme_cli_demo --format json --output results.json
+```
+
+## Common manifest options
+
+The manifest supports YAML and JSON. A file-based manifest looks like this:
+
+```yaml
+project_name: my_screen
+structure_only: false
+proteins:
+  fasta_file: proteins.fasta
+ligands:
+  csv_file: ligands.csv
+  name_column: name
+  smiles_column: smiles
+gpu_mode: auto
+use_existing_results: true
+settings:
+  recycling_steps: 4
+  sampling_steps: 200
+  diffusion_samples: 1
+  enable_msa_cache: true
+```
+
+Add `protein_drug_filter` to run selected protein/ligand pairs only:
+
+```yaml
+protein_drug_filter:
+  enabled: true
+  pairs:
+    - [WT, compound_a]
+```
+
+Prediction options go under `settings`. They use the same names and structures as the Streamlit controls; the CLI rejects unknown options before queueing jobs. For advanced options such as affinity multi-sampling, pocket constraints, templates, or mutation steering, copy the corresponding setting structure from the app configuration. MSA credentials should be supplied through environment variables (`BOLTZ_MSA_USERNAME` and `BOLTZ_MSA_PASSWORD`, or `MSA_API_KEY_VALUE`), not stored in the manifest.
