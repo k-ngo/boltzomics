@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional, Tuple
 import streamlit as st
 import re
+import math
 import pandas as pd
 import requests
 import time
@@ -575,6 +576,209 @@ def display_binding_pocket_section(protein_sequence: str = None, default_constra
                 }
     
     return None
+
+
+def normalize_distance_constraints(distance_constraints: Any) -> List[Dict[str, Any]]:
+    """Validate Boltz residue/atom contact constraints and return YAML-ready values."""
+    if distance_constraints is None:
+        return []
+    if not isinstance(distance_constraints, list):
+        raise ValueError("Distance constraints must be a list of constraint objects.")
+
+    def normalize_token(token: Any, label: str) -> List[Any]:
+        if not isinstance(token, (list, tuple)) or len(token) != 2:
+            raise ValueError(f"{label} must be [CHAIN_ID, RES_IDX/ATOM_NAME].")
+        chain_id = str(token[0]).strip()
+        if not chain_id:
+            raise ValueError(f"{label} needs a chain ID.")
+        residue_or_atom = token[1]
+        if isinstance(residue_or_atom, bool):
+            raise ValueError(f"{label} residue index must be a positive integer or RES_IDX/ATOM_NAME.")
+        if isinstance(residue_or_atom, int):
+            if residue_or_atom < 1:
+                raise ValueError(f"{label} residue index must be at least 1.")
+            normalized_residue_or_atom: Any = residue_or_atom
+        else:
+            text = str(residue_or_atom).strip()
+            if re.fullmatch(r"[1-9]\d*", text):
+                normalized_residue_or_atom = int(text)
+            elif re.fullmatch(r"[1-9]\d*/[^/\s]+", text):
+                normalized_residue_or_atom = text
+            else:
+                raise ValueError(
+                    f"{label} residue/atom must be a positive residue index (for example 226) "
+                    "or RES_IDX/ATOM_NAME (for example 77/NZ)."
+                )
+        return [chain_id, normalized_residue_or_atom]
+
+    normalized = []
+    for index, constraint in enumerate(distance_constraints, start=1):
+        if not isinstance(constraint, dict):
+            raise ValueError(f"Distance constraint {index} must be an object.")
+        token1 = normalize_token(constraint.get("token1"), f"Distance constraint {index} endpoint 1")
+        token2 = normalize_token(constraint.get("token2"), f"Distance constraint {index} endpoint 2")
+        try:
+            max_distance = float(constraint.get("max_distance", 6.0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Distance constraint {index} maximum distance must be a number.") from exc
+        if not math.isfinite(max_distance) or not 4.0 <= max_distance <= 20.0:
+            raise ValueError(f"Distance constraint {index} maximum distance must be between 4 and 20 Å.")
+        force = constraint.get("force", False)
+        if not isinstance(force, bool):
+            raise ValueError(f"Distance constraint {index} force must be true or false.")
+        normalized.append({
+            "token1": token1,
+            "token2": token2,
+            "max_distance": max_distance,
+            "force": force,
+        })
+    return normalized
+
+
+def display_distance_constraints_section() -> List[Dict[str, Any]]:
+    """Collect optional residue-to-residue or atom-to-atom distance constraints."""
+    applied_constraints = st.session_state.get("distance_constraints", [])
+    if "batch_distance_constraint_rows" not in st.session_state:
+        st.session_state["batch_distance_constraint_rows"] = []
+        for constraint in normalize_distance_constraints(applied_constraints):
+            st.session_state["batch_distance_constraint_rows"].append({
+                "id": st.session_state.get("batch_distance_constraint_next_id", 0),
+                "token1": f"{constraint['token1'][0]},{constraint['token1'][1]}",
+                "token2": f"{constraint['token2'][0]},{constraint['token2'][1]}",
+                "max_distance": constraint["max_distance"],
+                "force": constraint["force"],
+            })
+            st.session_state["batch_distance_constraint_next_id"] = (
+                st.session_state.get("batch_distance_constraint_next_id", 0) + 1
+            )
+        if not st.session_state["batch_distance_constraint_rows"]:
+            st.session_state["batch_distance_constraint_rows"] = [{"id": 0}]
+            st.session_state["batch_distance_constraint_next_id"] = 1
+
+    st.subheader("Residue/Atom Distance Constraints")
+    st.markdown(
+        "Add a maximum-distance restraint between two residues or atoms. For example, "
+        "`A,226` to `A,290` restrains two residues in chain A; `A,77/NZ` selects one atom. "
+        "Residue indices start at 1."
+    )
+    st.caption(
+        "Each residue endpoint represents the residue as a whole. Boltz compares atom pairs "
+        "between the two endpoints. Turn on Force to add Boltz’s inference-time potential."
+    )
+
+    rows = st.session_state["batch_distance_constraint_rows"]
+    remove_ids = []
+    for row in rows:
+        row_id = row["id"]
+        cols = st.columns([2.4, 2.4, 1.0, 0.9, 0.35], vertical_alignment="bottom")
+        with cols[0]:
+            st.text_input(
+                "Endpoint 1 (chain,residue/atom)",
+                value=row.get("token1", ""),
+                placeholder="A,226 or A,77/NZ",
+                key=f"batch_distance_token1_{row_id}",
+            )
+        with cols[1]:
+            st.text_input(
+                "Endpoint 2 (chain,residue/atom)",
+                value=row.get("token2", ""),
+                placeholder="A,290",
+                key=f"batch_distance_token2_{row_id}",
+            )
+        with cols[2]:
+            st.number_input(
+                "Max distance (Å)",
+                min_value=4.0,
+                max_value=20.0,
+                value=float(row.get("max_distance", 6.0)),
+                step=0.1,
+                key=f"batch_distance_max_{row_id}",
+            )
+        with cols[3]:
+            st.checkbox(
+                "Force",
+                value=bool(row.get("force", False)),
+                help="Use Boltz’s inference-time contact potential; this also enables --use_potentials.",
+                key=f"batch_distance_force_{row_id}",
+            )
+        with cols[4]:
+            if st.button(
+                "",
+                key=f"batch_distance_remove_{row_id}",
+                disabled=len(rows) == 1,
+                icon=":material/delete:",
+                type="tertiary",
+            ):
+                remove_ids.append(row_id)
+
+    if remove_ids:
+        st.session_state["batch_distance_constraint_rows"] = [
+            row for row in rows if row["id"] not in remove_ids
+        ]
+        st.rerun()
+
+    add_col, apply_col, clear_col = st.columns([1.4, 1.5, 1.2])
+    with add_col:
+        add_row = st.button("Add another distance pair", key="batch_distance_add")
+    with apply_col:
+        apply_rows = st.button("Apply distance constraints", key="batch_distance_apply", icon=":material/check_circle:")
+    with clear_col:
+        clear_constraints = st.button(
+            "Clear applied",
+            key="batch_distance_clear",
+            disabled=not bool(applied_constraints),
+            type="tertiary",
+        )
+
+    if add_row:
+        next_id = int(st.session_state.get("batch_distance_constraint_next_id", 0))
+        st.session_state["batch_distance_constraint_rows"].append({"id": next_id})
+        st.session_state["batch_distance_constraint_next_id"] = next_id + 1
+        st.rerun()
+
+    if clear_constraints:
+        st.session_state["distance_constraints"] = []
+        st.success("Applied distance constraints cleared. Click Apply to save any edits above.")
+        applied_constraints = []
+
+    if apply_rows:
+        raw_constraints = []
+        try:
+            for row in rows:
+                row_id = row["id"]
+                raw_token1 = st.session_state.get(f"batch_distance_token1_{row_id}", "").strip()
+                raw_token2 = st.session_state.get(f"batch_distance_token2_{row_id}", "").strip()
+                if not raw_token1 and not raw_token2:
+                    continue
+                if not raw_token1 or not raw_token2:
+                    raise ValueError(f"Distance pair {row_id + 1} needs both endpoints.")
+
+                def parse_endpoint(value: str, label: str) -> List[Any]:
+                    parts = [part.strip() for part in value.split(",", 1)]
+                    if len(parts) != 2:
+                        raise ValueError(f"{label} must look like A,226 or A,77/NZ.")
+                    return [parts[0], parts[1]]
+
+                raw_constraints.append({
+                    "token1": parse_endpoint(raw_token1, f"Distance pair {row_id + 1} endpoint 1"),
+                    "token2": parse_endpoint(raw_token2, f"Distance pair {row_id + 1} endpoint 2"),
+                    "max_distance": st.session_state.get(f"batch_distance_max_{row_id}", 6.0),
+                    "force": st.session_state.get(f"batch_distance_force_{row_id}", False),
+                })
+            normalized = normalize_distance_constraints(raw_constraints)
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            st.session_state["distance_constraints"] = normalized
+            applied_constraints = normalized
+            if normalized:
+                st.success(f"Applied {len(normalized)} distance constraint(s).")
+            else:
+                st.success("Applied distance constraints cleared.")
+
+    if applied_constraints:
+        st.info(f"{len(applied_constraints)} distance constraint(s) are applied to the next screening run.")
+    return applied_constraints
 
 def display_ptm_section(protein_sequence: str = None, default_ptms: Dict = None, protein_sequences: List[Tuple[str, str]] = None) -> Dict:
     """
@@ -1226,6 +1430,94 @@ def parse_mutations(mutation_text: str) -> List[List[Tuple[str, int, str]]]:
         mutants.append(mutations)
     
     return mutants
+
+
+def suggest_chain_start_from_mutations(mutation_text: str, chain_sequence: str) -> Dict[str, Any]:
+    """Infer possible 1-based chain starts from mutation WT residues.
+
+    A start is returned only when one offset makes every entered mutation's
+    wild-type residue agree with the supplied chain sequence. Multiple exact
+    offsets are reported as ambiguous so callers can ask the user to choose.
+    """
+    amino_acids = "ACDEFGHIKLMNPQRSTVWY"
+    entries: List[Tuple[str, int]] = []
+    invalid_entries: List[str] = []
+
+    for mutant in re.split(r"[,;]", str(mutation_text or "")):
+        mutant = mutant.strip()
+        if not mutant:
+            continue
+        for part in re.split(r"[/+\-]", mutant):
+            part = part.strip().upper()
+            if not part:
+                invalid_entries.append(part)
+                continue
+            match = re.fullmatch(r"([A-Z])(\d+)([A-Z])", part)
+            if not match:
+                invalid_entries.append(part)
+                continue
+            wt_residue, position_text, _new_residue = match.groups()
+            if wt_residue not in amino_acids or _new_residue not in amino_acids:
+                invalid_entries.append(part)
+                continue
+            try:
+                position = int(position_text)
+            except (TypeError, ValueError, OverflowError):
+                invalid_entries.append(part)
+                continue
+            if position < 1:
+                invalid_entries.append(part)
+                continue
+            entries.append((wt_residue, position))
+
+    # Repeated alternatives at the same WT position provide no extra evidence.
+    entries = list(dict.fromkeys(entries))
+    if invalid_entries:
+        return {
+            "status": "invalid_mutations",
+            "candidates": [],
+            "mutation_count": len(entries),
+            "invalid_entries": invalid_entries,
+        }
+    if not entries:
+        return {
+            "status": "no_mutations",
+            "candidates": [],
+            "mutation_count": 0,
+            "invalid_entries": [],
+        }
+
+    sequence = re.sub(r"\s+", "", str(chain_sequence or "")).upper()
+    if not sequence or not re.fullmatch(r"[A-Z]+", sequence):
+        return {
+            "status": "invalid_sequence",
+            "candidates": [],
+            "mutation_count": len(entries),
+            "invalid_entries": [],
+        }
+
+    possible_starts: Optional[set] = None
+    for wt_residue, position in entries:
+        mutation_starts = {
+            position - index
+            for index, residue in enumerate(sequence)
+            if residue == wt_residue and position - index >= 1
+        }
+        possible_starts = (
+            mutation_starts
+            if possible_starts is None
+            else possible_starts.intersection(mutation_starts)
+        )
+        if not possible_starts:
+            break
+
+    candidates = sorted(possible_starts or [])
+    return {
+        "status": "unique" if len(candidates) == 1 else "ambiguous" if candidates else "no_match",
+        "candidates": candidates,
+        "mutation_count": len(entries),
+        "invalid_entries": [],
+    }
 
 def apply_mutations_to_sequence(wt_sequence: str, mutations: List[Tuple[str, int, str]], chain_starts: Dict[str, int], chains_dict: Dict[str, str] = None) -> str:
     """

@@ -321,7 +321,7 @@ def parse_protein_chains(protein_sequence, msa_path=None):
             protein_chains.append(protein_entry)
     return protein_chains
 
-def create_boltz_yaml(workspace_name, design_name, protein_sequence, ligand_smiles, binding_pocket_constraints=None, cofactor_info=None, template_cif_path=None, ptm_modifications=None, msa_path=None, template_options=None):
+def create_boltz_yaml(workspace_name, design_name, protein_sequence, ligand_smiles, binding_pocket_constraints=None, cofactor_info=None, template_cif_path=None, ptm_modifications=None, msa_path=None, template_options=None, distance_constraints=None):
     """Create a YAML file for Boltz prediction.
 
     Args:
@@ -330,6 +330,7 @@ def create_boltz_yaml(workspace_name, design_name, protein_sequence, ligand_smil
         protein_sequence: Protein amino acid sequence (chains separated by ':')
         ligand_smiles: SMILES string for the ligand
         binding_pocket_constraints: Optional binding pocket constraints
+        distance_constraints: Optional residue/atom pair maximum-distance constraints
         cofactor_info: Optional cofactor information
         template_cif_path: Optional path to template CIF file
         ptm_modifications: Optional post-translational modifications
@@ -425,6 +426,7 @@ def create_boltz_yaml(workspace_name, design_name, protein_sequence, ligand_smil
         yaml_content["sequences"].append(cofactor_entry)
 
     # Add constraints if provided and valid
+    constraints = []
     if binding_pocket_constraints and binding_pocket_constraints.get('contacts'):
         contacts = []
         for c in binding_pocket_constraints.get('contacts', []):
@@ -435,39 +437,27 @@ def create_boltz_yaml(workspace_name, design_name, protein_sequence, ligand_smil
                 except (ValueError, TypeError):
                     res_idx = c[1]
                 contacts.append([c[0], res_idx])
-        pocket_constraint = {
+        constraints.append({
             "pocket": {
                 "binder": binding_pocket_constraints.get('binder', 'X'),
                 "contacts": contacts,
                 "max_distance": float(binding_pocket_constraints.get('max_distance', 6.0)),
                 "force": bool(binding_pocket_constraints.get('force', False)),
             }
-        }
-        import copy
-        yaml_content_copy = copy.deepcopy(yaml_content)
-        yaml_content_copy["constraints"] = [pocket_constraint]
-        constraints = yaml_content_copy.pop("constraints")
-        with open(filepath, 'w') as f:
-            yaml.dump(yaml_content_copy, f, default_flow_style=False)
-            f.write("constraints:\n")
-            for constraint in constraints:
-                f.write("  - pocket:\n")
-                f.write(f"      binder: {constraint['pocket']['binder']}\n")
-                contacts_str = yaml.dump(constraint['pocket']['contacts'], default_flow_style=True).strip()
-                f.write(f"      contacts: {contacts_str}\n")
-                f.write(f"      max_distance: {constraint['pocket']['max_distance']}\n")
-                f.write(f"      force: {str(constraint['pocket']['force']).lower()}\n")
-            # Always append the properties block for affinity prediction
-            f.write("properties:\n")
-            f.write("  - affinity:\n")
-            f.write("      binder: X\n")
-    else:
-        with open(filepath, 'w') as f:
-            yaml.dump(yaml_content, f, default_flow_style=False)
-            # Always append the properties block for affinity prediction
-            f.write("properties:\n")
-            f.write("  - affinity:\n")
-            f.write("      binder: X\n")
+        })
+    try:
+        from .drug_screening_input import normalize_distance_constraints
+    except ImportError:
+        from drug_screening_input import normalize_distance_constraints
+    constraints.extend(
+        {"contact": constraint}
+        for constraint in normalize_distance_constraints(distance_constraints)
+    )
+    if constraints:
+        yaml_content["constraints"] = constraints
+    yaml_content["properties"] = [{"affinity": {"binder": "X"}}]
+    with open(filepath, 'w') as f:
+        yaml.safe_dump(yaml_content, f, default_flow_style=False, sort_keys=False)
 
     # Boltz 2.2 supports CIF and PDB templates plus optional enforced-template
     # potentials. This legacy helper writes its file above, so append the block.

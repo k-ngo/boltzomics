@@ -132,6 +132,9 @@ from drug_screening_input import (
     validate_protein_sequence,
     display_mutation_discovery_section,
     display_binding_pocket_section,
+    display_distance_constraints_section,
+    normalize_distance_constraints,
+    suggest_chain_start_from_mutations,
     display_ptm_section,
     display_protein_drug_filter_section,
     should_evaluate_protein_drug_pair,
@@ -162,6 +165,20 @@ JOB_MANAGER_EXECUTOR_STATE_KEY = "_screening_job_manager_executor_registered"
 JOB_MANAGER_INIT_ERROR_KEY = "_screening_job_manager_init_error"
 QUEUE_STATUS_REFRESH_INTERVAL_SECONDS = 1.0  # Auto-refresh job queue UI every 1s while jobs are active
 QUEUE_NEXT_REFRESH_STATE_KEY = "_screening_queue_next_refresh"
+
+
+def _apply_mutation_chain_start_suggestion() -> None:
+    """Apply the currently selected, sequence-supported chain start."""
+    suggestion = st.session_state.get("_mutation_chain_start_suggestion")
+    if not isinstance(suggestion, (tuple, list)) or len(suggestion) != 2:
+        return
+    chain_id, start_number = suggestion
+    try:
+        start_number = int(start_number)
+    except (TypeError, ValueError, OverflowError):
+        return
+    if str(chain_id) and start_number >= 1:
+        st.session_state[f"chain_start_{chain_id}"] = start_number
 
 
 @st.cache_resource(show_spinner=False)
@@ -395,6 +412,7 @@ def _prediction_reproducibility_params(params: Dict[str, Any]) -> Dict[str, Any]
         "template_options",
         "boltz_runtime_options",
         "binding_pocket_constraints",
+        "distance_constraints",
         "cofactor_info",
         "ptm_modifications",
         "structure_only",
@@ -856,6 +874,7 @@ def create_screening_boltz_yaml(
     ptm_modifications=None,
     msa_path=None,
     target_directory: Optional[str] = None,
+    distance_constraints: Optional[List[Dict[str, Any]]] = None,
 ):
     """Create a YAML file for Boltz prediction in the project-specific directory.
 
@@ -866,6 +885,7 @@ def create_screening_boltz_yaml(
         ligand_smiles: SMILES string for the ligand
         project_name: Name of the screening project
         binding_pocket_constraints: Optional binding pocket constraints
+        distance_constraints: Optional residue/atom pair maximum-distance constraints
         cofactor_info: Optional cofactor information
         template_cif_path: Optional path to a template CIF or PDB file
         template_options: Optional Boltz 2.2 template mapping/forcing options
@@ -957,7 +977,9 @@ def create_screening_boltz_yaml(
             template_entry["threshold"] = float(options.get("threshold", 2.0))
         yaml_content["templates"] = [template_entry]
     
-    # Add constraints if provided and valid
+    constraints = []
+
+    # Add pocket constraints if provided and valid.
     if binding_pocket_constraints and binding_pocket_constraints.get('contacts'):
         contacts = []
         for c in binding_pocket_constraints.get('contacts', []):
@@ -968,38 +990,26 @@ def create_screening_boltz_yaml(
                 except (ValueError, TypeError):
                     res_idx = c[1]
                 contacts.append([c[0], res_idx])
-        pocket_constraint = {
+        constraints.append({
             "pocket": {
                 "binder": binding_pocket_constraints.get('binder', 'X'),
                 "contacts": contacts,
                 "max_distance": float(binding_pocket_constraints.get('max_distance', 6.0)),
                 "force": bool(binding_pocket_constraints.get('force', False)),
             }
-        }
-        yaml_content_copy = copy.deepcopy(yaml_content)
-        yaml_content_copy["constraints"] = [pocket_constraint]
-        constraints = yaml_content_copy.pop("constraints")
-        with open(filepath, 'w') as f:
-            yaml.dump(yaml_content_copy, f, default_flow_style=False)
-            f.write("constraints:\n")
-            for constraint in constraints:
-                f.write("  - pocket:\n")
-                f.write(f"      binder: {constraint['pocket']['binder']}\n")
-                contacts_str = yaml.dump(constraint['pocket']['contacts'], default_flow_style=True).strip()
-                f.write(f"      contacts: {contacts_str}\n")
-                f.write(f"      max_distance: {constraint['pocket']['max_distance']}\n")
-                f.write(f"      force: {str(constraint['pocket']['force']).lower()}\n")
-            if not structure_only:
-                f.write("properties:\n")
-                f.write("  - affinity:\n")
-                f.write("      binder: X\n")
-    else:
-        with open(filepath, 'w') as f:
-            yaml.dump(yaml_content, f, default_flow_style=False)
-            if not structure_only:
-                f.write("properties:\n")
-                f.write("  - affinity:\n")
-                f.write("      binder: X\n")
+        })
+
+    # Boltz calls residue/atom pair distance restraints "contact" constraints.
+    for distance_constraint in normalize_distance_constraints(distance_constraints):
+        constraints.append({"contact": distance_constraint})
+
+    if constraints:
+        yaml_content["constraints"] = constraints
+    if not structure_only:
+        yaml_content["properties"] = [{"affinity": {"binder": "X"}}]
+
+    with open(filepath, 'w') as f:
+        yaml.safe_dump(yaml_content, f, default_flow_style=False, sort_keys=False)
     
     return filepath
 
@@ -1145,6 +1155,7 @@ def run_boltz_with_retry(
     use_cached_msa: bool = False,
     enable_msa_cache: bool = True,
     execution_directory: Optional[str] = None,
+    distance_constraints: Optional[List[Dict[str, Any]]] = None,
 ):
     """Run Boltz workflow with retry logic and validation.
 
@@ -1157,6 +1168,10 @@ def run_boltz_with_retry(
         enable_msa_cache: If True, cache newly generated MSA files after successful runs.
     """
     last_error = None
+    distance_constraints = normalize_distance_constraints(distance_constraints)
+    use_potentials = bool(
+        use_potentials or any(constraint.get("force", False) for constraint in distance_constraints)
+    )
     total_attempts = max_retry_attempts + 1 if enable_retries else 1
     current_msa_path = msa_path
     current_use_cached_msa = bool(use_cached_msa)
@@ -1216,6 +1231,7 @@ def run_boltz_with_retry(
                 ptm_modifications,
                 msa_path=current_msa_path,  # MSA caching support
                 target_directory=execution_directory,
+                distance_constraints=distance_constraints,
             )
             yaml_dir = os.path.dirname(yaml_filepath)
             yaml_name = os.path.splitext(os.path.basename(yaml_filepath))[0]
@@ -2055,6 +2071,7 @@ def _create_result_entry(
             "step_scale": params.get("step_scale", 1.5),
             "runtime_options": params.get("boltz_runtime_options") or {},
             "template_options": params.get("template_options") or {},
+            "distance_constraints": params.get("distance_constraints") or [],
             "affinity_mw_correction": params.get("affinity_mw_correction", False),
             "affinity_consensus_enabled": params.get("affinity_consensus_enabled", False),
             "affinity_consensus_mode": params.get("affinity_consensus_mode", "weighted"),
@@ -2120,6 +2137,7 @@ def _persist_result_entry(
             computation_time=computation_time,
             template_cif_path=template_cif_path,
             binding_pocket_constraints=binding_pocket_constraints,
+            distance_constraints=(result_entry.get("boltz2_parameters") or {}).get("distance_constraints"),
             boltz_commands=boltz_commands,
         )
     except Exception as exc:
@@ -2161,6 +2179,9 @@ def _create_failure_result_entry(
         # instead of being deduplicated against its siblings.
         "prediction_replica": int((job.parameters or {}).get("prediction_replica", 1) or 1),
         "prediction_replicas": int((job.parameters or {}).get("prediction_replicas", 1) or 1),
+        "boltz2_parameters": {
+            "distance_constraints": (job.parameters or {}).get("distance_constraints") or [],
+        },
         "timestamp": datetime.now().isoformat(),
         "computation_time_seconds": computation_time,
     }
@@ -2222,6 +2243,7 @@ def execute_screening_job(job: ScreeningJob, worker_id: int = 0) -> Tuple[Dict[s
         ligand_display_name=ligand_display_name,
         use_gpu=params.get("use_gpu", True),
         binding_pocket_constraints=params.get("binding_pocket_constraints"),
+        distance_constraints=params.get("distance_constraints"),
         override=params.get("override", False),
         recycling_steps=params.get("recycling_steps", 3),
         sampling_steps=params.get("sampling_steps", 200),
@@ -2298,6 +2320,7 @@ def execute_screening_job(job: ScreeningJob, worker_id: int = 0) -> Tuple[Dict[s
         "worker_id": worker_id,
         "worker_cuda_visible_devices": effective_cuda_visible_devices,
         "binding_pocket_constraints": params.get("binding_pocket_constraints"),
+        "distance_constraints": params.get("distance_constraints"),
         "template_cif_path": params.get("template_cif_path"),
         "boltz_command": _build_boltz_command(yaml_filename, params),
     }
@@ -2962,8 +2985,13 @@ def run_screening_prediction(
     boltz_runtime_options: Optional[Dict[str, Any]] = None,
     mutation_steering_config: Optional[Dict[str, Any]] = None,
     prediction_replicas: int = 1,
+    distance_constraints: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict], float]:
     """Run screening prediction using Boltz2."""
+    distance_constraints = normalize_distance_constraints(distance_constraints)
+    use_potentials = bool(
+        use_potentials or any(constraint.get("force", False) for constraint in distance_constraints)
+    )
     results: List[Dict] = []
     protein_drug_filter = st.session_state.get('protein_drug_filter')
     replica_total = max(1, int(prediction_replicas or 1))
@@ -3068,6 +3096,7 @@ def run_screening_prediction(
                 "retry_delay_base": retry_delay_base,
                 "template_cif_path": template_cif_path,
                 "template_options": template_options,
+                "distance_constraints": command_params.get("distance_constraints") or [],
                 "boltz_runtime_options": boltz_runtime_options or {},
                 "use_cached_msa": command_params.get("use_cached_msa", False),
                 "enable_msa_cache": enable_msa_cache,
@@ -3160,6 +3189,7 @@ def run_screening_prediction(
                 "num_subsampled_msa": num_subsampled_msa,
                 "template_cif_path": template_cif_path,
                 "template_options": template_options,
+                "distance_constraints": distance_constraints,
                 "boltz_runtime_options": boltz_runtime_options or {},
                 "mutation_steering_config": mutation_steering_config,
                 "binding_pocket_constraints": _resolve_mutation_steering_constraints(
@@ -3295,6 +3325,7 @@ def run_screening_prediction(
                         ligand_display_name="" if structure_only else wt_seed_job["drug_name"],
                         use_gpu=use_gpu,
                         binding_pocket_constraints=cp.get("binding_pocket_constraints"),
+                        distance_constraints=cp.get("distance_constraints"),
                         override=cp["override"],
                         recycling_steps=cp.get("recycling_steps", recycling_steps),
                         sampling_steps=cp.get("sampling_steps", sampling_steps),
@@ -3478,6 +3509,7 @@ def run_screening_prediction(
                             ligand_smiles="" if structure_only else job["drug_smiles"],
                             project_name=project_name,
                             binding_pocket_constraints=cp.get("binding_pocket_constraints"),
+                            distance_constraints=cp.get("distance_constraints"),
                             cofactor_info=cofactor_info,
                             template_cif_path=template_cif_path,
                             template_options=cp.get("template_options", template_options),
@@ -3591,6 +3623,7 @@ def run_screening_prediction(
                 ligand_display_name="" if structure_only else job["drug_name"],
                 use_gpu=use_gpu,
                 binding_pocket_constraints=cp.get("binding_pocket_constraints"),
+                distance_constraints=cp.get("distance_constraints"),
                 override=cp["override"],
                 recycling_steps=cp.get("recycling_steps", recycling_steps),
                 sampling_steps=cp.get("sampling_steps", sampling_steps),
@@ -5177,8 +5210,11 @@ def main():
                 # Residue numbering section
                 # Parse chains to get chain IDs
                 chain_starts = {}
+                chains_dict = {}
+                sequence_valid_for_suggestion = False
                 if wt_protein_input.strip():
                     is_valid, error_msg, chains_dict, upper_seq = validate_protein_sequence(wt_protein_input.strip())
+                    sequence_valid_for_suggestion = bool(is_valid and chains_dict)
                     if is_valid and chains_dict:
                         # Create input fields for each chain
                         for chain_id in sorted(chains_dict.keys()):
@@ -5218,6 +5254,65 @@ def main():
                     st.info(
                         "Mutation input auto-corrections: normalized case/whitespace and mutation separators."
                     )
+
+                # Infer sequence numbering only when every entered WT residue
+                # supports the same offset. Ambiguous alignments are offered as
+                # choices instead of being applied silently.
+                if sequence_valid_for_suggestion and mutations_input.strip():
+                    chain_start_candidates = []
+                    chain_start_results = {}
+                    for chain_id, chain_sequence in sorted(chains_dict.items()):
+                        inference = suggest_chain_start_from_mutations(
+                            mutations_input, chain_sequence
+                        )
+                        chain_start_results[chain_id] = inference
+                        chain_start_candidates.extend(
+                            (chain_id, start_number)
+                            for start_number in inference.get("candidates", [])
+                        )
+
+                    if chain_start_candidates:
+                        if len(chain_start_candidates) == 1:
+                            selected_suggestion = chain_start_candidates[0]
+                            st.caption(
+                                f"Mutation list aligns to Chain {selected_suggestion[0]} "
+                                f"starting at residue {selected_suggestion[1]}."
+                            )
+                        else:
+                            st.info(
+                                "More than one exact sequence alignment matches the mutation list. "
+                                "Choose the chain start that matches your residue numbering."
+                            )
+                            selected_suggestion = st.selectbox(
+                                "Suggested chain start",
+                                options=chain_start_candidates,
+                                format_func=lambda item: f"Chain {item[0]}: residue {item[1]}",
+                                key="mutation_chain_start_suggestion_choice",
+                            )
+
+                        st.session_state["_mutation_chain_start_suggestion"] = selected_suggestion
+                        st.button(
+                            f"Use suggested start {selected_suggestion[1]} for Chain {selected_suggestion[0]}",
+                            key="apply_mutation_chain_start_suggestion",
+                            on_click=_apply_mutation_chain_start_suggestion,
+                        )
+                    elif all(
+                        result.get("status") in {"no_mutations", "invalid_mutations"}
+                        for result in chain_start_results.values()
+                    ):
+                        st.caption(
+                            "Enter standard mutation codes such as K262R/H265L to suggest a chain start."
+                        )
+                    elif len(chains_dict) > 1:
+                        st.caption(
+                            "Automatic suggestion aligns the full mutation list to one chain. "
+                            "For mutations spanning multiple chains, set each chain start manually."
+                        )
+                    else:
+                        st.warning(
+                            "No single chain start makes all entered wild-type residues match this sequence. "
+                            "Check the sequence and mutation list."
+                        )
                 
                 # Show mutation format help
                 with st.popover("Mutation Format Help"):
@@ -5428,7 +5523,7 @@ def main():
             ":material/biotech: Mutation Discovery",
             ":material/hexagon: Co-factors",
             ":material/description: Structural Template",
-            ":material/donut_large: Binding Pocket",
+            ":material/straighten: Pocket & Distance Constraints",
             ":material/science: Post-translational Modifications",
             ":material/filter_alt: Protein-Drug Pairing"
         ])
@@ -5679,7 +5774,7 @@ def main():
                     if source_ids:
                         template_options["template_id"] = source_ids[0] if len(source_ids) == 1 else source_ids
 
-        # Tab 3: Binding Pocket
+        # Tab 3: Pocket and distance constraints
         with tab3:
             # Binding pocket constraints section
             binding_pocket_constraints = None
@@ -5699,11 +5794,17 @@ def main():
                     protein_sequence_for_pocket = protein_sequences[0][1]  # Get sequence from first protein
 
             # Call display_binding_pocket_section with the protein sequence (can be None)
-            binding_pocket_constraints = display_binding_pocket_section(protein_sequence_for_pocket)
+            binding_pocket_constraints = (
+                display_binding_pocket_section(protein_sequence_for_pocket)
+                or st.session_state.get("binding_pocket_constraints")
+            )
 
             # Store binding pocket constraints in session state
             if binding_pocket_constraints:
                 st.session_state.binding_pocket_constraints = binding_pocket_constraints
+
+            distance_constraints = display_distance_constraints_section()
+            st.session_state.distance_constraints = distance_constraints
 
         # Tab 4: Post-translational Modifications
         with tab4:
@@ -5750,6 +5851,7 @@ def main():
         use_potentials_setting
         or (mutation_steering_enabled and mutation_steering_enable_potentials)
         or (binding_pocket_constraints or {}).get("force", False)
+        or any(constraint.get("force", False) for constraint in distance_constraints or [])
         or (template_options or {}).get("force", False)
     )
     method = method_prior_value if mutation_steering_enabled else None
@@ -6147,6 +6249,17 @@ def main():
                     st.write(f"- {example_residues}")
                 st.write(f" - Max distance: {max_distance} Å")
 
+            if distance_constraints:
+                st.write("**:material/straighten: Applied distance constraints:**")
+                for constraint in distance_constraints:
+                    endpoint1 = constraint["token1"]
+                    endpoint2 = constraint["token2"]
+                    force_label = " · enforced with potential" if constraint.get("force") else ""
+                    st.write(
+                        f"- {endpoint1[0]},{endpoint1[1]} ↔ {endpoint2[0]},{endpoint2[1]} "
+                        f"≤ {constraint['max_distance']:g} Å{force_label}"
+                    )
+
             st.write("**:material/tune: Sampling setup:**")
             st.write(
                 f"- Boltz potentials (`--use_potentials`): {'Enabled' if use_potentials else 'Disabled'}"
@@ -6359,6 +6472,7 @@ def main():
                         "template_options": template_options,
                         "boltz_runtime_options": boltz_runtime_options,
                         "binding_pocket_constraints": binding_pocket_constraints,
+                        "distance_constraints": distance_constraints,
                         "mutation_steering_config": mutation_steering_config,
                         "cofactor_info": cofactor_info,
                         "ptm_modifications": ptm_modifications,
@@ -6452,6 +6566,7 @@ def main():
                             diffusion_samples_affinity=diffusion_samples_affinity,
                             cofactor_info=cofactor_info,
                             binding_pocket_constraints=binding_pocket_constraints,
+                            distance_constraints=distance_constraints,
                             mutation_steering_config=mutation_steering_config,
                             enable_retries=enable_retries,
                             max_retry_attempts=max_retry_attempts,

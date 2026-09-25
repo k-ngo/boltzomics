@@ -249,7 +249,7 @@ def load_project_data(project_name: str, results_dir: str) -> Optional[Dict]:
         # Optionally, sum computation times if desired
         metadata['computation_time_seconds'] = sum(computation_times) if computation_times else None
         # --- Load extra fields if present ---
-        for extra_field in ["template_cif_path", "binding_pocket_constraints", "boltz_commands"]:
+        for extra_field in ["template_cif_path", "binding_pocket_constraints", "distance_constraints", "boltz_commands"]:
             if extra_field in metadata:
                 pass  # already present
             else:
@@ -382,6 +382,7 @@ def save_screening_results(results: Union[List[Dict], Dict],
                       computation_time: Optional[float] = None,
                       template_cif_path: Optional[str] = None,
                       binding_pocket_constraints: Optional[dict] = None,
+                      distance_constraints: Optional[list] = None,
                       boltz_commands: Optional[list] = None) -> Optional[str]:
     """
     Save screening results to project-specific folder.
@@ -480,6 +481,7 @@ def save_screening_results(results: Union[List[Dict], Dict],
             "results": deduplicated_results,
             "template_cif_path": template_cif_path if template_cif_path is not None else existing_metadata.get("template_cif_path"),
             "binding_pocket_constraints": binding_pocket_constraints if binding_pocket_constraints is not None else existing_metadata.get("binding_pocket_constraints"),
+            "distance_constraints": distance_constraints if distance_constraints is not None else existing_metadata.get("distance_constraints"),
             "boltz_commands": boltz_commands if boltz_commands is not None else existing_metadata.get("boltz_commands")
         }
         

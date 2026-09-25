@@ -75,6 +75,7 @@ SUPPORTED_SETTINGS = {
     "template_options",
     "boltz_runtime_options",
     "binding_pocket_constraints",
+    "distance_constraints",
     "cofactor_info",
     "ptm_modifications",
     "prediction_timeout_seconds",
@@ -290,6 +291,7 @@ def load_job_spec(spec_path: os.PathLike[str] | str) -> Dict[str, Any]:
         "affinity_multisampling_profiles",
         "affinity_multisampling_settings",
         "affinity_multisampling_refinement_steps",
+        "distance_constraints",
     )
     for key in list_settings:
         if key in settings and settings[key] is not None and not isinstance(settings[key], list):
@@ -323,15 +325,31 @@ def load_job_spec(spec_path: os.PathLike[str] | str) -> Dict[str, Any]:
                     f"affinity_multisampling_profiles entry {index} needs sampling_steps_affinity "
                     "and diffusion_samples_affinity."
                 )
+    if settings.get("distance_constraints") is not None:
+        try:
+            settings["distance_constraints"] = app.normalize_distance_constraints(
+                settings["distance_constraints"]
+            )
+        except ValueError as exc:
+            raise JobSpecError(f"settings.distance_constraints is invalid: {exc}") from exc
     if "template_cif_path" in settings and settings["template_cif_path"]:
         settings["template_cif_path"] = str(
             _manifest_file_path(settings["template_cif_path"], manifest_path.parent, "settings.template_cif_path")
         )
     pocket_forced = bool((settings.get("binding_pocket_constraints") or {}).get("force", False))
+    distance_forced = any(
+        constraint.get("force", False) for constraint in settings.get("distance_constraints", [])
+    )
     template_forced = bool((settings.get("template_options") or {}).get("force", False))
     steering = settings.get("mutation_steering_config") or {}
     steering_forced = bool(steering.get("enabled", False) and steering.get("use_potentials", False))
-    settings["use_potentials"] = bool(settings.get("use_potentials", False) or pocket_forced or template_forced or steering_forced)
+    settings["use_potentials"] = bool(
+        settings.get("use_potentials", False)
+        or pocket_forced
+        or distance_forced
+        or template_forced
+        or steering_forced
+    )
 
     default_accelerator = "cpu" if settings.get("use_gpu") is False else "gpu"
     accelerator = str(settings.get("accelerator", default_accelerator)).strip().lower()

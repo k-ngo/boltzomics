@@ -693,6 +693,17 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                         st.write(f"Binder: {binder}")
                     if max_distance is not None:
                         st.write(f"Max distance: {max_distance} Å")
+                distance_constraints = project_data.get("distance_constraints") or []
+                if distance_constraints:
+                    st.markdown("**Residue/atom distance constraints**")
+                    for constraint in distance_constraints:
+                        token1 = constraint.get("token1", ["?", "?"])
+                        token2 = constraint.get("token2", ["?", "?"])
+                        force = " (forced with potential)" if constraint.get("force") else ""
+                        st.write(
+                            f"{token1[0]},{token1[1]} ↔ {token2[0]},{token2[1]} "
+                            f"≤ {constraint.get('max_distance', 6.0)} Å{force}"
+                        )
                 boltz_cmds = project_data.get("boltz_commands")
                 if boltz_cmds:
                     st.markdown("**Boltz predict command(s)**")
@@ -1651,6 +1662,17 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                     st.write(f"Binder: {binder}")
                 if max_distance is not None:
                     st.write(f"Max distance: {max_distance} Å")
+            distance_constraints = project_data.get("distance_constraints") or []
+            if distance_constraints:
+                st.markdown("**Residue/atom distance constraints**")
+                for constraint in distance_constraints:
+                    token1 = constraint.get("token1", ["?", "?"])
+                    token2 = constraint.get("token2", ["?", "?"])
+                    force = " (forced with potential)" if constraint.get("force") else ""
+                    st.write(
+                        f"{token1[0]},{token1[1]} ↔ {token2[0]},{token2[1]} "
+                        f"≤ {constraint.get('max_distance', 6.0)} Å{force}"
+                    )
             # Boltz command(s)
             boltz_cmds = project_data.get("boltz_commands")
             if boltz_cmds:
