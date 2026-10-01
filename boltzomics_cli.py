@@ -281,7 +281,6 @@ def load_job_spec(spec_path: os.PathLike[str] | str) -> Dict[str, Any]:
         "mutation_steering_config",
         "template_options",
         "boltz_runtime_options",
-        "binding_pocket_constraints",
     )
     for key in mapping_settings:
         if key in settings and settings[key] is not None and not isinstance(settings[key], dict):
@@ -325,6 +324,13 @@ def load_job_spec(spec_path: os.PathLike[str] | str) -> Dict[str, Any]:
                     f"affinity_multisampling_profiles entry {index} needs sampling_steps_affinity "
                     "and diffusion_samples_affinity."
                 )
+    if settings.get("binding_pocket_constraints") is not None:
+        try:
+            settings["binding_pocket_constraints"] = app.normalize_binding_pocket_constraints(
+                settings["binding_pocket_constraints"]
+            )
+        except ValueError as exc:
+            raise JobSpecError(f"settings.binding_pocket_constraints is invalid: {exc}") from exc
     if settings.get("distance_constraints") is not None:
         try:
             settings["distance_constraints"] = app.normalize_distance_constraints(
@@ -336,7 +342,9 @@ def load_job_spec(spec_path: os.PathLike[str] | str) -> Dict[str, Any]:
         settings["template_cif_path"] = str(
             _manifest_file_path(settings["template_cif_path"], manifest_path.parent, "settings.template_cif_path")
         )
-    pocket_forced = bool((settings.get("binding_pocket_constraints") or {}).get("force", False))
+    pocket_forced = any(
+        pocket["force"] for pocket in app.normalize_binding_pocket_constraints(settings.get("binding_pocket_constraints"))
+    )
     distance_forced = any(
         constraint.get("force", False) for constraint in settings.get("distance_constraints", [])
     )

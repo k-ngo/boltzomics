@@ -381,7 +381,7 @@ def save_screening_results(results: Union[List[Dict], Dict],
                       results_dir: str,
                       computation_time: Optional[float] = None,
                       template_cif_path: Optional[str] = None,
-                      binding_pocket_constraints: Optional[dict] = None,
+                      binding_pocket_constraints: Optional[Union[dict, List[dict]]] = None,
                       distance_constraints: Optional[list] = None,
                       boltz_commands: Optional[list] = None) -> Optional[str]:
     """

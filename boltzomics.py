@@ -134,6 +134,11 @@ from drug_screening_input import (
     display_binding_pocket_section,
     display_distance_constraints_section,
     normalize_distance_constraints,
+    normalize_binding_pocket_constraints,
+    binding_pocket_yaml_entries,
+    display_applied_pocket_constraints,
+    display_constraint_examples,
+    validate_boltz_constraint_targets,
     suggest_chain_start_from_mutations,
     display_ptm_section,
     display_protein_drug_filter_section,
@@ -772,10 +777,10 @@ def _boltz_job_file_lock(
 def _resolve_mutation_steering_constraints(
     protein_name: str,
     protein_sequence: str,
-    base_constraints: Optional[Dict[str, Any]],
+    base_constraints: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]],
     structure_only: bool,
     mutation_steering_config: Optional[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
+) -> Optional[Union[Dict[str, Any], List[Dict[str, Any]]]]:
     """
     Build mutation-neighborhood pocket constraints, preserving manual constraints when present.
     """
@@ -800,6 +805,17 @@ def _resolve_mutation_steering_constraints(
     neighborhood = int(mutation_steering_config.get("window", 3))
     neighborhood = max(0, neighborhood)
     steering_max_distance = float(mutation_steering_config.get("max_distance", 6.0))
+
+    if isinstance(base_constraints, list):
+        pockets = normalize_binding_pocket_constraints(base_constraints)
+        generated = _resolve_mutation_steering_constraints(
+            protein_name, protein_sequence, None, structure_only, mutation_steering_config
+        )
+        if generated:
+            manual_contacts = {tuple(contact) for pocket in pockets if pocket["binder"] == generated["binder"]
+                               for contact in pocket["contacts"]}
+            generated["contacts"] = [contact for contact in generated["contacts"] if tuple(contact) not in manual_contacts]
+        return pockets + ([generated] if generated and generated["contacts"] else [])
 
     contacts_set: Set[Tuple[str, int]] = set()
     if base_constraints and base_constraints.get("contacts"):
@@ -979,31 +995,14 @@ def create_screening_boltz_yaml(
     
     constraints = []
 
-    # Add pocket constraints if provided and valid.
-    if binding_pocket_constraints and binding_pocket_constraints.get('contacts'):
-        contacts = []
-        for c in binding_pocket_constraints.get('contacts', []):
-            if len(c) >= 2:
-                # Try to cast residue index to int if possible
-                try:
-                    res_idx = int(c[1])
-                except (ValueError, TypeError):
-                    res_idx = c[1]
-                contacts.append([c[0], res_idx])
-        constraints.append({
-            "pocket": {
-                "binder": binding_pocket_constraints.get('binder', 'X'),
-                "contacts": contacts,
-                "max_distance": float(binding_pocket_constraints.get('max_distance', 6.0)),
-                "force": bool(binding_pocket_constraints.get('force', False)),
-            }
-        })
+    constraints.extend(binding_pocket_yaml_entries(binding_pocket_constraints))
 
     # Boltz calls residue/atom pair distance restraints "contact" constraints.
     for distance_constraint in normalize_distance_constraints(distance_constraints):
         constraints.append({"contact": distance_constraint})
 
     if constraints:
+        validate_boltz_constraint_targets(constraints, yaml_content["sequences"])
         yaml_content["constraints"] = constraints
     if not structure_only:
         yaml_content["properties"] = [{"affinity": {"binder": "X"}}]
@@ -5776,6 +5775,7 @@ def main():
 
         # Tab 3: Pocket and distance constraints
         with tab3:
+            display_constraint_examples()
             # Binding pocket constraints section
             binding_pocket_constraints = None
 
@@ -5794,16 +5794,10 @@ def main():
                     protein_sequence_for_pocket = protein_sequences[0][1]  # Get sequence from first protein
 
             # Call display_binding_pocket_section with the protein sequence (can be None)
-            binding_pocket_constraints = (
-                display_binding_pocket_section(protein_sequence_for_pocket)
-                or st.session_state.get("binding_pocket_constraints")
-            )
+            binding_pocket_constraints = display_binding_pocket_section(protein_sequence_for_pocket)
+            st.session_state.binding_pocket_constraints = binding_pocket_constraints
 
-            # Store binding pocket constraints in session state
-            if binding_pocket_constraints:
-                st.session_state.binding_pocket_constraints = binding_pocket_constraints
-
-            distance_constraints = display_distance_constraints_section()
+            distance_constraints = display_distance_constraints_section(protein_sequence_for_pocket, drug_smiles)
             st.session_state.distance_constraints = distance_constraints
 
         # Tab 4: Post-translational Modifications
@@ -5850,7 +5844,7 @@ def main():
     use_potentials = bool(
         use_potentials_setting
         or (mutation_steering_enabled and mutation_steering_enable_potentials)
-        or (binding_pocket_constraints or {}).get("force", False)
+        or any(pocket["force"] for pocket in normalize_binding_pocket_constraints(binding_pocket_constraints))
         or any(constraint.get("force", False) for constraint in distance_constraints or [])
         or (template_options or {}).get("force", False)
     )
@@ -6232,25 +6226,10 @@ def main():
                         st.write(f"- CCD Code: {cofactor_info['ccd']}")
                     st.write("- Chain ID: T")
             
-            # Display binding pocket constraints if provided
-            binding_pocket_constraints = st.session_state.get('binding_pocket_constraints')
-            if binding_pocket_constraints and binding_pocket_constraints.get('contacts'):
-                contacts = binding_pocket_constraints.get('contacts', [])
-                max_distance = binding_pocket_constraints.get('max_distance', 7.0)
-                binder = binding_pocket_constraints.get('binder', 'X')
-                # Show first contact as the pocket label
-                if contacts:
-                    first_contact = contacts[0]
-                    pocket_label = f"{first_contact[0]}{first_contact[1]}"
-                    example_residues = ', '.join([f"{c[0]}{c[1]}" for c in contacts[:5]])
-                    if len(contacts) > 5:
-                        example_residues += f" ... and {len(contacts) - 5} more"
-                    st.write(f"**:material/donut_large: Binding pocket [<chain><resid>]:**")
-                    st.write(f"- {example_residues}")
-                st.write(f" - Max distance: {max_distance} Å")
+            display_applied_pocket_constraints(st.session_state.get('binding_pocket_constraints'))
 
             if distance_constraints:
-                st.write("**:material/straighten: Applied distance constraints:**")
+                st.write("**:material/straighten: Applied pair-distance constraints:**")
                 for constraint in distance_constraints:
                     endpoint1 = constraint["token1"]
                     endpoint2 = constraint["token2"]

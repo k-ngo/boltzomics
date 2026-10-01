@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import streamlit as st
 import re
 import math
+from functools import lru_cache
 import pandas as pd
 import requests
 import time
@@ -394,188 +395,390 @@ def generate_contacts_from_sequence_matches(sequence: str, selected_chains: List
                     contacts.append([chain, str(idx + j)])
     return contacts
 
-def display_binding_pocket_section(protein_sequence: str = None, default_constraints: Dict = None) -> Dict:
-    """
-    Display binding pocket constraints section and return the constraints dictionary.
-    
-    Args:
-        protein_sequence: Current protein sequence (can be None or empty)
-        default_constraints: Default constraints to use
-        
-    Returns:
-        Dictionary with binding pocket constraints or None if not set
-    """
-    if default_constraints is None:
-        default_constraints = {
-            'binder': 'X',
-            'contacts': [],
-            'max_distance': 7.0,
-            'force': False,
-            'mode': 'automated',
-            'sequence': '',
-            'manual_residues': ''
-        }
-    
-    # Try to get the latest input from session state (Multi-Protein Mode)
-    latest_protein_seq = None
-    if 'protein_input_normal' in st.session_state and st.session_state['protein_input_normal']:
-        latest_protein_seq = st.session_state['protein_input_normal']
-    # Try to get the latest input from session state (Mutation Mode)
-    elif 'wt_protein_input' in st.session_state and st.session_state['wt_protein_input']:
-        latest_protein_seq = st.session_state['wt_protein_input']
-    # Fallback to argument
-    elif protein_sequence:
-        latest_protein_seq = protein_sequence
-    else:
-        latest_protein_seq = ''
+def parse_pocket_residue_positions(chain: str, positions: str, chain_length: Optional[int] = None) -> List[List[Any]]:
+    """Expand friendly position lists and ranges, using input-sequence numbering."""
+    residues = []
+    positions = re.sub(r"\s*[-–—]\s*", "-", positions.strip())
+    for part in re.split(r"[\s,]+", positions):
+        if not part:
+            continue
+        match = re.fullmatch(r"([1-9]\d*)(?:-([1-9]\d*))?", part)
+        if not match:
+            raise ValueError(f"Invalid residue position '{part}'. Use numbers or ranges, for example 123, 125, 130-135.")
+        start = int(match[1])
+        end = int(match[2] or start)
+        if end < start:
+            raise ValueError(f"Residue range '{part}' must go from a smaller to a larger position.")
+        if chain_length is not None and end > chain_length:
+            raise ValueError(f"Chain {chain} has {chain_length} residues; position {end} is outside the input sequence.")
+        if end - start > 10000:
+            raise ValueError("Select a pocket range of at most 10001 residues.")
+        residues.extend(range(start, end + 1))
+    return [[chain, residue] for residue in dict.fromkeys(residues)]
 
-    st.markdown("""
-    Specify the binding pocket residues for the ligand. This information will be used as constraints for structure prediction.
-    """)
 
-    col1, col2, _ = st.columns(3)
-    with col1:
-        pocket_mode = st.segmented_control(
-            "Pocket constraint mode",
-            options=["Automated (by sequence)", "Manual (by residue list)"],
-            default="Automated (by sequence)",
-            key="batch_pocket_mode"
-        )
+def normalize_binding_pocket_constraints(constraints: Any) -> List[Dict[str, Any]]:
+    """Accept legacy single pockets and multiple independent Boltz2 pockets."""
+    if constraints is None:
+        return []
+    if isinstance(constraints, dict):
+        constraints = [constraints] if constraints.get("contacts") else []
+    if not isinstance(constraints, list):
+        raise ValueError("Binding pocket constraints must be an object or a list of objects.")
+    normalized = []
+    for index, pocket in enumerate(constraints, 1):
+        if not isinstance(pocket, dict):
+            raise ValueError(f"Pocket constraint {index} must be an object.")
+        binder = str(pocket.get("binder", "X")).strip()
+        if not binder:
+            raise ValueError(f"Pocket constraint {index} needs a binder chain.")
+        contacts = pocket.get("contacts")
+        if not isinstance(contacts, list) or not contacts:
+            raise ValueError(f"Pocket constraint {index} needs at least one pocket residue or ligand atom.")
+        # Contact and pocket endpoints use the same Boltz token syntax.
+        endpoints = normalize_distance_constraints([
+            {"token1": contact, "token2": contact,
+             "max_distance": pocket.get("max_distance", 6.0),
+             "force": pocket.get("force", False)}
+            for contact in contacts
+        ])
+        normalized.append({
+            **pocket,
+            "binder": binder,
+            "contacts": [list(contact) for contact in dict.fromkeys(
+                tuple(endpoint["token1"]) for endpoint in endpoints
+            )],
+            "max_distance": endpoints[0]["max_distance"],
+            "force": endpoints[0]["force"],
+        })
+    seen_contacts = {}
+    for index, pocket in enumerate(normalized, 1):
+        for chain, target in pocket["contacts"]:
+            key = (pocket["binder"], chain, target)
+            if key in seen_contacts and seen_contacts[key] != pocket["max_distance"]:
+                raise ValueError(f"Pocket constraint {index}: {chain},{target} already has a different distance limit for binder {pocket['binder']}. Use one limit for this contact.")
+            seen_contacts[key] = pocket["max_distance"]
+    return normalized
 
-    with col2:
-        binder_chain = "X"  # X is always the ligand
-        max_distance = st.number_input(
-            "Max distance (Å)",
-            min_value=4.0,
-            max_value=20.0,
-            icon=":material/arrow_range:",
-            value=float(default_constraints.get('max_distance', 7.0)),
-            step=0.1,
-            help="Boltz 2.2 supports pocket/contact distances from 4 Å to 20 Å.",
-            key="batch_max_distance_input"
-        )
-        force_constraint = st.toggle(
-            "Enforce pocket with potential",
-            value=bool(default_constraints.get('force', False)),
-            help=(
-                "Boltz 2.2: use the corrected pocket-contact potential to enforce this "
-                "distance during diffusion. This also enables --use_potentials."
-            ),
-            key="batch_force_pocket_constraint",
-        )
 
-    # Parse protein sequence to get chains
-    chains_dict = {}
-    is_valid = False
+def binding_pocket_yaml_entries(constraints: Any) -> List[Dict[str, Any]]:
+    """Keep editor metadata out of the Boltz YAML schema."""
+    return [{"pocket": {key: pocket[key] for key in
+                         ("binder", "contacts", "max_distance", "force")}}
+            for pocket in normalize_binding_pocket_constraints(constraints)]
 
-    if latest_protein_seq and latest_protein_seq.strip():
-        is_valid, _, chains_dict, _ = validate_protein_sequence(latest_protein_seq)
 
-    contacts = []
-
-    if pocket_mode == "Automated (by sequence)":
-        st.markdown("**Automated Mode:** Enter one or more short sequences, search for them in your protein chains, and select the chain(s) to use for each.")
-
-        # Initialize session state for sequence queries
-        if 'batch_pocket_seq_queries' not in st.session_state:
-            st.session_state['batch_pocket_seq_queries'] = [
-                {'seq': default_constraints.get('sequence', ''), 'id': 0}
-            ]
-
-        seq_queries = st.session_state['batch_pocket_seq_queries']
-        next_id = max([q['id'] for q in seq_queries], default=0) + 1
-        all_contacts = []
-        remove_ids = []
-
-        for i, q in enumerate(seq_queries):
-            cols = st.columns([3, 3, 1], vertical_alignment="bottom")
-            with cols[0]:
-                seq = st.text_input(f"Sequence to search for", value=q['seq'], key=f"batch_pocket_seq_query_{q['id']}")
-                
-                # Find matching chains for this sequence
-                matching_chains, chain_to_match_indices = find_sequence_matches_in_chains(seq, chains_dict)
-                
-                with cols[1]:
-                    selected_chains = st.multiselect(
-                        "Select chain(s) containing the sequence",
-                        options=matching_chains,
-                        default=matching_chains,
-                        key=f"batch_pocket_chain_multiselect_{q['id']}"
-                    )
-                
-                with cols[2]:
-                    trash_disabled = len(seq_queries) == 1
-                    if st.button("", key=f"batch_pocket_seq_trash_{q['id']}", disabled=trash_disabled, icon=":material/delete:", type="tertiary"):
-                        remove_ids.append(q['id'])
-                
-                # Prepare contacts for this sequence
-                contacts = generate_contacts_from_sequence_matches(seq, selected_chains, chain_to_match_indices, chains_dict)
-                
-                if matching_chains:
-                    all_residues = sorted(set([f'{c},{r}' for c, r in contacts]))
-                    st.write(f"Residues matched: {all_residues}")
-                elif seq:
-                    st.info("No matches found for the sequence in any chain.")
-                
-                all_contacts.extend(contacts)
-            
-            # Remove any deleted queries
-            if remove_ids:
-                st.session_state['batch_pocket_seq_queries'] = [q for q in seq_queries if q['id'] not in remove_ids]
-                st.rerun()
-            
-            # Add plus button
-            if st.button("", key="batch_pocket_seq_add", icon=":material/add:", type="tertiary"):
-                st.session_state['batch_pocket_seq_queries'].append({'seq': '', 'id': next_id})
-                st.rerun()
-            
-            # Show all contacts summary
-            if all_contacts:
-                all_residues = sorted(set([f'{c},{r}' for c, r in all_contacts]))
-                st.write(f"All residues matched: {all_residues}")
-            
-            _, col, _ = st.columns([2, 1, 2])
-            with col:
-                pocket_submitted = st.button("Apply Binding Pocket Constraints", key="batch_pocket_auto_submit", icon=":material/check_circle:")
-            
-            if pocket_submitted and all_contacts:
-                st.success("Binding pocket constraints updated (automated mode).")
-                return {
-                    'binder': binder_chain.strip(),
-                    'contacts': all_contacts,
-                    'max_distance': float(max_distance),
-                    'force': bool(force_constraint),
-                    'mode': 'automated',
-                    'sequence': ','.join([q['seq'] for q in st.session_state['batch_pocket_seq_queries']])
-                }
-        
-        else:  # Manual mode
-            st.markdown("**Manual Mode:** Enter residues as `CHAIN_ID,RES_IDX` separated by spaces (e.g., `A,123 B,45`).")
-            manual_residues = st.text_input(
-                "Residues (space-separated)", 
-                value=default_constraints.get('manual_residues', ''), 
-                key="batch_pocket_manual_residues"
+def display_applied_pocket_constraints(constraints: Any) -> None:
+    pockets = normalize_binding_pocket_constraints(constraints)
+    if pockets:
+        st.markdown("**Applied ligand → pocket constraints**")
+        for index, pocket in enumerate(pockets, 1):
+            contacts = ", ".join(f"{chain},{residue}" for chain, residue in pocket["contacts"])
+            enforcement = "potential enabled" if pocket["force"] else "model guidance"
+            st.write(
+                f"{index}. Binder {pocket['binder']} → each of [{contacts}] "
+                f"≤ {pocket['max_distance']:g} Å · {enforcement}"
             )
-            
-            # Parse manual input into [[CHAIN_ID, RES_IDX], ...]
-            contacts = parse_manual_binding_pocket_residues(manual_residues)
-            
-            _, col, _ = st.columns([2, 1, 2])
-            with col:
-                pocket_submitted = st.button("Apply Binding Pocket Constraints", key="batch_pocket_manual_submit", icon=":material/check_circle:")
-            
-            if pocket_submitted and contacts:
-                st.success("Binding pocket constraints updated (manual mode).")
-                return {
-                    'binder': binder_chain.strip(),
-                    'contacts': contacts,
-                    'max_distance': float(max_distance),
-                    'force': bool(force_constraint),
-                    'mode': 'manual',
-                    'manual_residues': manual_residues
-                }
-    
-    return None
+
+
+@lru_cache(maxsize=256)
+def boltz_ligand_atoms(smiles: str, affinity: bool = True) -> Tuple[Tuple[str, str], ...]:
+    """Use Boltz 2.2.1's SMILES preparation and canonical atom naming rules."""
+    from rdkit import Chem
+    if affinity:
+        from chembl_structure_pipeline.exclude_flag import exclude_flag
+        from chembl_structure_pipeline.standardizer import standardize_mol
+        from rdkit.Chem.MolStandardize import rdMolStandardize
+        molecule = Chem.MolFromSmiles(smiles, sanitize=False)
+        if molecule is None or exclude_flag(molecule, includeRDKitSanitization=False):
+            raise ValueError("This ligand cannot be prepared for Boltz affinity prediction.")
+        molecule = rdMolStandardize.LargestFragmentChooser().choose(molecule)
+        smiles = Chem.MolToSmiles(standardize_mol(molecule))
+    molecule = Chem.MolFromSmiles(smiles)
+    if molecule is None:
+        raise ValueError("The ligand SMILES could not be parsed.")
+    molecule = Chem.AddHs(molecule)
+    ranks = Chem.CanonicalRankAtoms(molecule)
+    return tuple((atom.GetSymbol().upper() + str(rank + 1), atom.GetSymbol())
+                 for atom, rank in zip(molecule.GetAtoms(), ranks) if atom.GetAtomicNum() != 1)
+
+
+def selected_residue_rows(contacts: List[List[Any]], chains: Dict[str, str], limit: float) -> List[Dict[str, Any]]:
+    """Build a deduplicated confirmation table from input-sequence positions."""
+    rows = []
+    seen = set()
+    for chain, position in contacts:
+        try:
+            position = int(position)
+        except (TypeError, ValueError):
+            continue
+        if (chain, position) in seen:
+            continue
+        seen.add((chain, position))
+        sequence = chains.get(chain, "")
+        residue = sequence[position - 1] if 1 <= position <= len(sequence) else "Unavailable"
+        rows.append({"Chain": chain, "Position (1-based)": position,
+                     "Residue": residue, "Ligand distance limit (Å)": limit})
+    return rows
+
+
+def validate_boltz_constraint_targets(constraints: List[Dict[str, Any]], sequences: List[Dict[str, Any]]) -> None:
+    """Check generated constraints against the chains actually written to the YAML."""
+    chains = {}
+    for entry in sequences:
+        kind, data = next(iter(entry.items()))
+        ids = data["id"] if isinstance(data["id"], list) else [data["id"]]
+        for chain in ids:
+            if chain in chains:
+                raise ValueError(f"Duplicate chain ID {chain} in the prediction input.")
+            chains[chain] = (kind, data)
+
+    def validate_endpoint(token):
+        chain, target = token
+        if chain not in chains:
+            raise ValueError(f"Constraint references chain {chain}, which is missing from this prediction.")
+        kind, data = chains[chain]
+        if kind == "ligand":
+            if not isinstance(target, str):
+                raise ValueError(f"Ligand chain {chain} needs an atom name, not a residue number.")
+            if data.get("smiles"):
+                names = {name for name, _ in boltz_ligand_atoms(data["smiles"], affinity=chain == "X")}
+                if target not in names:
+                    raise ValueError(f"Ligand atom {chain},{target} does not exist in this molecule. Available atoms: {', '.join(sorted(names))}.")
+        elif not isinstance(target, int) or not 1 <= target <= len(data["sequence"]):
+            raise ValueError(f"Chain {chain} needs a residue position between 1 and {len(data['sequence'])}.")
+
+    for constraint in constraints:
+        if "pocket" in constraint:
+            pocket = constraint["pocket"]
+            if pocket["binder"] not in chains:
+                raise ValueError(f"Pocket binder {pocket['binder']} is missing from this prediction. A ligand pocket requires a ligand input.")
+            for contact in pocket["contacts"]:
+                if contact[0] == pocket["binder"]:
+                    raise ValueError("Pocket contacts must belong to a different chain from the binder.")
+                validate_endpoint(contact)
+        if "contact" in constraint:
+            contact = constraint["contact"]
+            if contact["token1"] == contact["token2"]:
+                raise ValueError("A pair constraint needs two different endpoints.")
+            validate_endpoint(contact["token1"])
+            validate_endpoint(contact["token2"])
+
+
+def _remove_editor_row(rows_key: str, row_id: int) -> None:
+    # Callbacks run before rendering, so surviving widgets keep their values.
+    st.session_state[rows_key] = [row for row in st.session_state[rows_key] if row["id"] != row_id]
+
+
+def _add_pocket_chain(groups_key: str) -> None:
+    next_id_key = f"{groups_key}_next_id"
+    next_id = st.session_state[next_id_key]
+    st.session_state[groups_key].append({"id": next_id, "chain": "A", "positions": ""})
+    st.session_state[next_id_key] = next_id + 1
+
+
+def display_constraint_examples() -> None:
+    st.markdown("Choose what you want to bring closer: **the ligand to a pocket**, or **two specific endpoints**.")
+    with st.expander("Examples and how to use", expanded=False):
+        st.markdown("""
+**Place the ligand near a pocket:** Under Ligand → binding pocket, select protein chain A,
+enter residue positions `123, 125, 130-135`, and set the limit to **6 Å**.
+This guides the ligand within 6 Å of each selected residue. Click **Apply pocket constraints**.
+
+**Bring two protein residues closer:** Under Pair distance, choose Protein residue for both endpoints.
+Select chain A, position 123 and chain B, position 45. Set **6 Å** and click **Apply pair constraints**.
+
+**Target a particular ligand atom:** Choose Protein residue A,123 and Ligand atom X,O1.
+The limit applies between that residue and that named ligand atom.
+Replace O1 with the exact atom name from your ligand's Boltz structure.
+
+**Use different limits:** Add one pocket constraint for A,123 at **6 Å** and another for A,125 at **8 Å**.
+You can also add pair constraints. All applied constraints are combined in the prediction;
+multiple pockets are simultaneous requirements, not alternative binding sites.
+
+**Give each pair its own limit:** Add a protein pair A,123 ↔ B,45 at **6 Å**,
+then add another pair A,125 ↔ a selected ligand atom at **8 Å**.
+Each card has its own distance field and optional potential. Click **Apply pair constraints** to save both.
+
+**Numbering and supported targets:** Positions start at 1 in each input protein chain,
+which can differ from PDB numbering. Protein endpoints select whole residues; specific protein atoms
+such as 123/NZ are not supported. Ligand atom names are molecule-specific, so check them when screening
+different ligands. Supported limits are **4–20 Å**.
+
+**Strengthen a constraint:** Enable the distance potential to add guidance during sampling.
+The potential encourages the limit; it does not guarantee that every prediction satisfies it.
+Pocket/contact conditioning and these potentials require **Boltz 2.2 or later**.
+""")
+        st.markdown("[Boltz2 constraint documentation](https://github.com/jwohlwend/boltz/blob/v2.2.1/docs/prediction.md#constraints)")
+
+
+def display_binding_pocket_section(protein_sequence: str = None, default_constraints: Any = None) -> List[Dict[str, Any]]:
+    """Edit independently configured ligand-to-pocket constraints."""
+    applied = normalize_binding_pocket_constraints(
+        st.session_state.get("binding_pocket_constraints", default_constraints)
+    )
+    latest_protein_seq = (
+        protein_sequence or st.session_state.get("wt_protein_input")
+        or st.session_state.get("protein_input_normal") or ""
+    )
+    _, _, chains_dict, _ = validate_protein_sequence(latest_protein_seq) if latest_protein_seq else (False, "", {}, "")
+    st.subheader("Ligand → binding pocket")
+    st.markdown(
+        "Guide the **small molecule (chain X)** toward selected protein residues. "
+        "The distance limit is measured from the closest ligand atom to the closest atom "
+        "in **each listed residue**."
+    )
+    st.caption(
+        "Example: X → A,123 and B,45 at 6 Å asks the ligand to contact each residue within 6 Å. "
+        "To constrain A,123 ↔ B,45 directly, use the pair-distance section below."
+    )
+    st.caption(
+        "Add multiple pocket constraints for different residue groups and distance limits. "
+        "All applied pocket and pair constraints are used together in the same prediction."
+    )
+    if "batch_pocket_constraint_rows" not in st.session_state:
+        rows = []
+        for index, pocket in enumerate(applied):
+            rows.append({**pocket, "id": index,
+                         "manual_residues": " ".join(f"{c},{r}" for c, r in pocket["contacts"]),
+                         "mode": pocket.get("mode", "manual")})
+        st.session_state["batch_pocket_constraint_rows"] = rows or [{"id": 0}]
+        st.session_state["batch_pocket_constraint_next_id"] = len(rows) or 1
+    rows = st.session_state["batch_pocket_constraint_rows"]
+    drafts = []
+    for index, row in enumerate(rows, 1):
+        row_id = row["id"]
+        prefix = f"batch_pocket_{row_id}"
+        with st.container(border=True):
+            st.markdown(f"**Pocket constraint {index} · ligand X → protein residues**")
+            selection_col, distance_col = st.columns([2, 1])
+            with selection_col:
+                mode = st.selectbox(
+                    "Choose pocket residues using", ["Residue list", "Sequence search"],
+                    index=1 if row.get("mode") == "automated" else 0, key=f"{prefix}_mode",
+                )
+            with distance_col:
+                max_distance = st.number_input(
+                    "Ligand-to-pocket limit (Å)", min_value=4.0, max_value=20.0,
+                    value=float(row.get("max_distance", 6.0)), step=0.1, key=f"{prefix}_max",
+                    help="Closest atom pair between ligand X and each pocket residue; supported range: 4–20 Å.",
+                )
+            contacts = []
+            manual_residues = sequence = ""
+            draft_errors = []
+            if mode == "Residue list":
+                groups_key = f"{prefix}_residue_groups"
+                if groups_key not in st.session_state:
+                    groups = {}
+                    for chain, residue in row.get("contacts", []):
+                        groups.setdefault(chain, []).append(str(residue))
+                    st.session_state[groups_key] = [
+                        {"id": i, "chain": chain, "positions": ", ".join(positions)}
+                        for i, (chain, positions) in enumerate(groups.items())
+                    ] or [{"id": 0, "chain": "A", "positions": ""}]
+                    st.session_state[f"{groups_key}_next_id"] = len(groups) or 1
+                groups = st.session_state[groups_key]
+                for group in groups:
+                    group_prefix = f"{prefix}_group_{group['id']}"
+                    chain_col, residue_col, remove_col = st.columns([1, 3, 1], vertical_alignment="bottom")
+                    with chain_col:
+                        chain_options = sorted(chains_dict) or [chr(i) for i in range(65, 91) if chr(i) != "X"]
+                        chain = st.selectbox(
+                            "Protein chain", chain_options,
+                            index=chain_options.index(group["chain"]) if group["chain"] in chain_options else 0,
+                            key=f"{group_prefix}_chain",
+                        )
+                    with residue_col:
+                        positions = st.text_input(
+                            "Residue positions", value=group["positions"], placeholder="123, 125, 130-135",
+                            key=f"{group_prefix}_positions",
+                            help="Enter positions separated by commas or spaces. Ranges such as 130-135 are accepted. Positions start at 1 in the input sequence.",
+                        )
+                        if positions.strip():
+                            manual_residues += f" {chain}:{positions}"
+                            try:
+                                contacts.extend(parse_pocket_residue_positions(
+                                    chain, positions, len(chains_dict[chain]) if chain in chains_dict else None
+                                ))
+                            except ValueError as exc:
+                                draft_errors.append(str(exc))
+                    with remove_col:
+                        st.button("Remove", key=f"{group_prefix}_remove", disabled=len(groups) == 1, type="tertiary",
+                                  on_click=_remove_editor_row, args=(groups_key, group["id"]))
+                st.button("Add protein chain", key=f"{prefix}_add_chain", type="tertiary",
+                          on_click=_add_pocket_chain, args=(groups_key,))
+            else:
+                sequence = st.text_input(
+                    "Sequence fragments", value=row.get("sequence", ""),
+                    placeholder="ACDE FGH", key=f"{prefix}_sequence",
+                    help="Separate fragments with spaces or commas. All matched residues share this pocket's distance limit.",
+                ).strip().upper()
+                fragments = [fragment for fragment in re.split(r"[\s,]+", sequence) if fragment]
+                matches = [find_sequence_matches_in_chains(fragment, chains_dict) for fragment in fragments]
+                matching_chains = sorted({chain for chains, _ in matches for chain in chains})
+                selected_chains = st.multiselect(
+                    "Protein chains", matching_chains, default=matching_chains, key=f"{prefix}_chains",
+                )
+                for fragment, (chains, indices) in zip(fragments, matches):
+                    contacts.extend(generate_contacts_from_sequence_matches(fragment, selected_chains, indices, chains_dict))
+                    if not chains:
+                        draft_errors.append(f"No sequence match for {fragment}. Check the fragment and input protein.")
+                if contacts:
+                    st.caption("Matched residues: " + ", ".join(dict.fromkeys(f"{c},{r}" for c, r in contacts)))
+            for error in draft_errors:
+                st.warning(error)
+            force = st.toggle(
+                "Strengthen this constraint", value=bool(row.get("force", False)),
+                key=f"{prefix}_force",
+                help="Off: model guidance. On: also apply Boltz's distance potential during sampling. Predicted distances can still vary.",
+            )
+            if contacts:
+                preview_rows = selected_residue_rows(contacts, chains_dict, max_distance)
+                st.info(f"Each of the {len(preview_rows)} selected residues should be within {max_distance:g} Å of ligand X.")
+                st.markdown("**Confirm selected pocket residues**")
+                st.dataframe(preview_rows, hide_index=True, use_container_width=True)
+                st.caption("Preview of the current inputs. Click Apply pocket constraints to use this selection.")
+            st.button("Remove pocket constraint", key=f"{prefix}_remove", disabled=len(rows) == 1, type="tertiary",
+                      on_click=_remove_editor_row, args=("batch_pocket_constraint_rows", row_id))
+            drafts.append({"binder": "X", "contacts": contacts, "max_distance": max_distance,
+                           "force": force, "mode": "manual" if mode == "Residue list" else "automated",
+                           "manual_residues": manual_residues, "sequence": sequence, "_errors": draft_errors})
+    add_col, apply_col, clear_col = st.columns(3)
+    with add_col:
+        if st.button("Add pocket constraint", key="batch_pocket_add"):
+            next_id = st.session_state["batch_pocket_constraint_next_id"]
+            st.session_state["batch_pocket_constraint_rows"].append({"id": next_id})
+            st.session_state["batch_pocket_constraint_next_id"] = next_id + 1
+            st.rerun()
+    with apply_col:
+        apply = st.button("Apply pocket constraints", key="batch_pocket_apply", icon=":material/check_circle:")
+    with clear_col:
+        if st.button("Clear applied pockets", key="batch_pocket_clear", disabled=not applied, type="tertiary"):
+            applied = []
+            st.session_state["binding_pocket_constraints"] = []
+            st.success("Applied pocket constraints cleared.")
+    if apply:
+        try:
+            populated = [draft for draft in drafts if draft["manual_residues"].strip() or draft["sequence"].strip()]
+            errors = [error for draft in populated for error in draft.pop("_errors", [])]
+            if errors:
+                raise ValueError(" ".join(errors))
+            normalized = normalize_binding_pocket_constraints(populated)
+            for pocket in normalized:
+                for chain, residue in pocket["contacts"]:
+                    if not isinstance(residue, int):
+                        raise ValueError("Pocket residues must use chain,residue, for example A,123.")
+                    if chains_dict and (chain not in chains_dict or residue > len(chains_dict[chain])):
+                        raise ValueError(f"Pocket residue {chain},{residue} is outside the input protein sequence.")
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            applied = normalized
+            st.session_state["binding_pocket_constraints"] = applied
+            st.success(f"Applied {len(applied)} pocket constraint(s).")
+    st.caption("Edits take effect after Apply. Clear removes applied pockets from the next run.")
+    display_applied_pocket_constraints(applied)
+    return applied
 
 
 def normalize_distance_constraints(distance_constraints: Any) -> List[Dict[str, Any]]:
@@ -587,13 +790,13 @@ def normalize_distance_constraints(distance_constraints: Any) -> List[Dict[str, 
 
     def normalize_token(token: Any, label: str) -> List[Any]:
         if not isinstance(token, (list, tuple)) or len(token) != 2:
-            raise ValueError(f"{label} must be [CHAIN_ID, RES_IDX/ATOM_NAME].")
+            raise ValueError(f"{label} must be [CHAIN_ID, RES_IDX or LIGAND_ATOM_NAME].")
         chain_id = str(token[0]).strip()
         if not chain_id:
             raise ValueError(f"{label} needs a chain ID.")
         residue_or_atom = token[1]
-        if isinstance(residue_or_atom, bool):
-            raise ValueError(f"{label} residue index must be a positive integer or RES_IDX/ATOM_NAME.")
+        if residue_or_atom is None or isinstance(residue_or_atom, bool):
+            raise ValueError(f"{label} residue index must be a positive integer or RES_IDX or LIGAND_ATOM_NAME.")
         if isinstance(residue_or_atom, int):
             if residue_or_atom < 1:
                 raise ValueError(f"{label} residue index must be at least 1.")
@@ -602,12 +805,12 @@ def normalize_distance_constraints(distance_constraints: Any) -> List[Dict[str, 
             text = str(residue_or_atom).strip()
             if re.fullmatch(r"[1-9]\d*", text):
                 normalized_residue_or_atom = int(text)
-            elif re.fullmatch(r"[1-9]\d*/[^/\s]+", text):
+            elif re.fullmatch(r"[A-Za-z][A-Za-z0-9_'\*]*", text):
                 normalized_residue_or_atom = text
             else:
                 raise ValueError(
                     f"{label} residue/atom must be a positive residue index (for example 226) "
-                    "or RES_IDX/ATOM_NAME (for example 77/NZ)."
+                    "or a ligand atom name (for example O1). Protein atom selectors such as 77/NZ are not supported by Boltz2."
                 )
         return [chain_id, normalized_residue_or_atom]
 
@@ -632,153 +835,194 @@ def normalize_distance_constraints(distance_constraints: Any) -> List[Dict[str, 
             "max_distance": max_distance,
             "force": force,
         })
+    seen_pairs = {}
+    for index, pair in enumerate(normalized, 1):
+        key = frozenset((tuple(pair["token1"]), tuple(pair["token2"])))
+        if key in seen_pairs and seen_pairs[key] != pair["max_distance"]:
+            raise ValueError(f"Pair constraint {index} repeats the same endpoints with a different limit. Use one limit per pair.")
+        seen_pairs[key] = pair["max_distance"]
     return normalized
 
 
-def display_distance_constraints_section() -> List[Dict[str, Any]]:
-    """Collect optional residue-to-residue or atom-to-atom distance constraints."""
-    applied_constraints = st.session_state.get("distance_constraints", [])
+def display_distance_constraints_section(protein_sequence: str = None, ligand_smiles: Optional[List[Tuple[str, str]]] = None) -> List[Dict[str, Any]]:
+    """Edit pair contacts with explicit endpoint types and separate input fields."""
+    applied = st.session_state.get("distance_constraints", [])
     if "batch_distance_constraint_rows" not in st.session_state:
-        st.session_state["batch_distance_constraint_rows"] = []
-        for constraint in normalize_distance_constraints(applied_constraints):
-            st.session_state["batch_distance_constraint_rows"].append({
-                "id": st.session_state.get("batch_distance_constraint_next_id", 0),
-                "token1": f"{constraint['token1'][0]},{constraint['token1'][1]}",
-                "token2": f"{constraint['token2'][0]},{constraint['token2'][1]}",
-                "max_distance": constraint["max_distance"],
-                "force": constraint["force"],
-            })
-            st.session_state["batch_distance_constraint_next_id"] = (
-                st.session_state.get("batch_distance_constraint_next_id", 0) + 1
-            )
-        if not st.session_state["batch_distance_constraint_rows"]:
-            st.session_state["batch_distance_constraint_rows"] = [{"id": 0}]
-            st.session_state["batch_distance_constraint_next_id"] = 1
-
-    st.subheader("Residue/Atom Distance Constraints")
-    st.markdown(
-        "Add a maximum-distance restraint between two residues or atoms. For example, "
-        "`A,226` to `A,290` restrains two residues in chain A; `A,77/NZ` selects one atom. "
-        "Residue indices start at 1."
-    )
-    st.caption(
-        "Each residue endpoint represents the residue as a whole. Boltz compares atom pairs "
-        "between the two endpoints. Turn on Force to add Boltz’s inference-time potential."
-    )
-
-    rows = st.session_state["batch_distance_constraint_rows"]
-    remove_ids = []
-    for row in rows:
-        row_id = row["id"]
-        cols = st.columns([2.4, 2.4, 1.0, 0.9, 0.35], vertical_alignment="bottom")
-        with cols[0]:
-            st.text_input(
-                "Endpoint 1 (chain,residue/atom)",
-                value=row.get("token1", ""),
-                placeholder="A,226 or A,77/NZ",
-                key=f"batch_distance_token1_{row_id}",
-            )
-        with cols[1]:
-            st.text_input(
-                "Endpoint 2 (chain,residue/atom)",
-                value=row.get("token2", ""),
-                placeholder="A,290",
-                key=f"batch_distance_token2_{row_id}",
-            )
-        with cols[2]:
-            st.number_input(
-                "Max distance (Å)",
-                min_value=4.0,
-                max_value=20.0,
-                value=float(row.get("max_distance", 6.0)),
-                step=0.1,
-                key=f"batch_distance_max_{row_id}",
-            )
-        with cols[3]:
-            st.checkbox(
-                "Force",
-                value=bool(row.get("force", False)),
-                help="Use Boltz’s inference-time contact potential; this also enables --use_potentials.",
-                key=f"batch_distance_force_{row_id}",
-            )
-        with cols[4]:
-            if st.button(
-                "",
-                key=f"batch_distance_remove_{row_id}",
-                disabled=len(rows) == 1,
-                icon=":material/delete:",
-                type="tertiary",
-            ):
-                remove_ids.append(row_id)
-
-    if remove_ids:
         st.session_state["batch_distance_constraint_rows"] = [
-            row for row in rows if row["id"] not in remove_ids
-        ]
-        st.rerun()
+            {**constraint, "id": index} for index, constraint in enumerate(applied)
+        ] or [{"id": 0}]
+        st.session_state["batch_distance_constraint_next_id"] = len(applied) or 1
+    latest_sequence = (protein_sequence or st.session_state.get("wt_protein_input")
+                       or st.session_state.get("protein_input_normal") or "")
+    _, _, protein_chains, _ = validate_protein_sequence(latest_sequence) if latest_sequence else (False, "", {}, "")
+    cofactors = st.session_state.get("cofactor_info") or []
+    if isinstance(cofactors, dict):
+        cofactors = [cofactors]
+    ligand_chains = ["X"] + [chr(ord("T") + index) for index, cofactor in enumerate(cofactors[:4])
+                             if cofactor.get("smiles") or cofactor.get("ccd")]
 
-    add_col, apply_col, clear_col = st.columns([1.4, 1.5, 1.2])
-    with add_col:
-        add_row = st.button("Add another distance pair", key="batch_distance_add")
-    with apply_col:
-        apply_rows = st.button("Apply distance constraints", key="batch_distance_apply", icon=":material/check_circle:")
-    with clear_col:
-        clear_constraints = st.button(
-            "Clear applied",
-            key="batch_distance_clear",
-            disabled=not bool(applied_constraints),
-            type="tertiary",
-        )
-
-    if add_row:
-        next_id = int(st.session_state.get("batch_distance_constraint_next_id", 0))
-        st.session_state["batch_distance_constraint_rows"].append({"id": next_id})
-        st.session_state["batch_distance_constraint_next_id"] = next_id + 1
-        st.rerun()
-
-    if clear_constraints:
-        st.session_state["distance_constraints"] = []
-        st.success("Applied distance constraints cleared. Click Apply to save any edits above.")
-        applied_constraints = []
-
-    if apply_rows:
-        raw_constraints = []
-        try:
-            for row in rows:
-                row_id = row["id"]
-                raw_token1 = st.session_state.get(f"batch_distance_token1_{row_id}", "").strip()
-                raw_token2 = st.session_state.get(f"batch_distance_token2_{row_id}", "").strip()
-                if not raw_token1 and not raw_token2:
+    st.subheader("Pair distance · endpoint 1 ↔ endpoint 2")
+    st.markdown(
+        "Bring **two selected residues or ligand atoms** within a distance limit. "
+        "Choose each endpoint below."
+    )
+    st.caption("Protein residue pairs use the closest atom pair. Two ligand atom endpoints use those exact atoms.")
+    rows = st.session_state["batch_distance_constraint_rows"]
+    drafts = []
+    for index, row in enumerate(rows, 1):
+        row_id = row["id"]
+        prefix = f"batch_distance_{row_id}"
+        with st.container(border=True):
+            st.markdown(f"**Pair constraint {index}**")
+            endpoint_cols = st.columns(2)
+            endpoints = []
+            descriptions = []
+            for endpoint_index, col in enumerate(endpoint_cols, 1):
+                token = row.get(f"token{endpoint_index}", ["A", ""])
+                if isinstance(token, str):  # Draft rows from earlier versions.
+                    token = token.split(",", 1) if "," in token else ["A", ""]
+                chain, target = token
+                atom_default = isinstance(target, str) and bool(target) and not target.isdigit()
+                endpoint_prefix = f"{prefix}_endpoint{endpoint_index}"
+                with col:
+                    kind = st.selectbox(
+                        f"Endpoint {endpoint_index}", ["Protein residue", "Ligand atom"],
+                        index=1 if atom_default else 0, key=f"{endpoint_prefix}_kind",
+                    )
+                    chain_col, target_col = st.columns([1, 2])
+                    with chain_col:
+                        options = sorted(protein_chains) or [chr(i) for i in range(65, 91) if chr(i) != "X"]
+                        if kind == "Ligand atom":
+                            options = ligand_chains
+                        chain_value = st.selectbox(
+                            "Chain", options, index=options.index(chain) if chain in options else 0,
+                            key=f"{endpoint_prefix}_{kind}_chain",
+                            format_func=(lambda value: "X · screened ligand" if value == "X" else value),
+                        )
+                    with target_col:
+                        if kind == "Protein residue":
+                            residue_default = int(target) if str(target).isdigit() and int(target) > 0 else None
+                            target_value = st.number_input(
+                                "Residue position", min_value=1, value=residue_default, step=1,
+                                placeholder="e.g. 123", key=f"{endpoint_prefix}_residue",
+                                help="Position starts at 1 in this chain's input sequence.",
+                            )
+                        else:
+                            preview_ligands = ligand_smiles or []
+                            if chain_value != "X":
+                                cofactor_index = ord(chain_value) - ord("T")
+                                cofactor = cofactors[cofactor_index]
+                                preview_ligands = [(f"Co-factor {chain_value}", cofactor["smiles"])] if cofactor.get("smiles") else []
+                            if preview_ligands:
+                                preview_index = 0
+                                if len(preview_ligands) > 1:
+                                    preview_index = st.selectbox(
+                                        "Show atoms from ligand", range(len(preview_ligands)),
+                                        format_func=lambda i, ligands=preview_ligands: ligands[i][0], key=f"{endpoint_prefix}_preview_ligand",
+                                    )
+                                    st.caption("This atom constraint applies to every screened ligand. Each molecule must contain the selected atom name.")
+                                preview_name, preview_smiles = preview_ligands[preview_index]
+                                try:
+                                    atoms = boltz_ligand_atoms(preview_smiles, affinity=chain_value == "X")
+                                except ValueError as exc:
+                                    st.error(str(exc))
+                                    atoms = ()
+                                atom_elements = dict(atoms)
+                                atom_options = [None] + list(atom_elements)
+                                target_value = st.selectbox(
+                                    "Ligand atom", atom_options,
+                                    index=atom_options.index(target) if target in atom_options else 0,
+                                    format_func=lambda name, elements=atom_elements: "Choose an atom" if name is None else f"{name} ({elements[name]})",
+                                    key=f"{endpoint_prefix}_{chain_value}_atom_choice_{preview_index}",
+                                    help=f"Names generated using Boltz2's atom naming rules for {preview_name}.",
+                                )
+                            else:
+                                target_value = st.text_input(
+                                    "Ligand atom name", value=str(target) if atom_default else "",
+                                    placeholder="e.g. O1", key=f"{endpoint_prefix}_atom",
+                                    help="Use the exact atom name in Boltz's generated ligand structure or the co-factor CCD definition. Add a ligand SMILES to choose from its atoms.",
+                                ).strip()
+                    endpoints.append([chain_value, target_value])
+                    descriptions.append(
+                        f"{'residue' if kind == 'Protein residue' else 'ligand atom'} {chain_value},{target_value}"
+                        if target_value else f"endpoint {endpoint_index}"
+                    )
+            limit_col, potential_col = st.columns(2)
+            with limit_col:
+                limit = st.number_input(
+                    "Distance between these endpoints (Å)", min_value=4.0, max_value=20.0,
+                    value=float(row.get("max_distance", 6.0)), step=0.1, key=f"{prefix}_max",
+                    help="Maximum distance for this pair only. Supported range: 4–20 Å.",
+                )
+            with potential_col:
+                force = st.toggle(
+                    "Strengthen this constraint", value=bool(row.get("force", False)),
+                    key=f"{prefix}_force",
+                    help="Off: model guidance. On: also apply Boltz's distance potential during sampling. Predicted distances can still vary.",
+                )
+            st.info(f"{descriptions[0]} ↔ {descriptions[1]} · distance ≤ {limit:g} Å")
+            confirmation = []
+            for endpoint_number, (chain, target) in enumerate(endpoints, 1):
+                if not target:
                     continue
-                if not raw_token1 or not raw_token2:
-                    raise ValueError(f"Distance pair {row_id + 1} needs both endpoints.")
-
-                def parse_endpoint(value: str, label: str) -> List[Any]:
-                    parts = [part.strip() for part in value.split(",", 1)]
-                    if len(parts) != 2:
-                        raise ValueError(f"{label} must look like A,226 or A,77/NZ.")
-                    return [parts[0], parts[1]]
-
-                raw_constraints.append({
-                    "token1": parse_endpoint(raw_token1, f"Distance pair {row_id + 1} endpoint 1"),
-                    "token2": parse_endpoint(raw_token2, f"Distance pair {row_id + 1} endpoint 2"),
-                    "max_distance": st.session_state.get(f"batch_distance_max_{row_id}", 6.0),
-                    "force": st.session_state.get(f"batch_distance_force_{row_id}", False),
-                })
-            normalized = normalize_distance_constraints(raw_constraints)
+                sequence = protein_chains.get(chain, "")
+                residue = sequence[target - 1] if isinstance(target, int) and 1 <= target <= len(sequence) else "Unavailable"
+                confirmation.append({"Endpoint": endpoint_number, "Chain": chain,
+                                     "Selection": f"Residue {target}" if isinstance(target, int) else f"Ligand atom {target}",
+                                     "Residue": residue if isinstance(target, int) else "—", "Pair limit (Å)": limit})
+            if confirmation:
+                st.markdown("**Confirm selected endpoints**")
+                st.dataframe(confirmation, hide_index=True, use_container_width=True)
+            st.button("Remove pair constraint", key=f"{prefix}_remove", disabled=len(rows) == 1, type="tertiary",
+                      on_click=_remove_editor_row, args=("batch_distance_constraint_rows", row_id))
+            drafts.append({"token1": endpoints[0], "token2": endpoints[1], "max_distance": limit, "force": force})
+    add_col, apply_col, clear_col = st.columns(3)
+    with add_col:
+        if st.button("Add pair constraint", key="batch_distance_add"):
+            next_id = st.session_state["batch_distance_constraint_next_id"]
+            st.session_state["batch_distance_constraint_rows"].append({"id": next_id})
+            st.session_state["batch_distance_constraint_next_id"] = next_id + 1
+            st.rerun()
+    with apply_col:
+        apply = st.button("Apply pair constraints", key="batch_distance_apply", icon=":material/check_circle:")
+    with clear_col:
+        if st.button("Clear applied pairs", key="batch_distance_clear", disabled=not applied, type="tertiary"):
+            applied = []
+            st.session_state["distance_constraints"] = []
+            st.success("Applied pair constraints cleared.")
+    if apply:
+        try:
+            populated = []
+            for index, draft in enumerate(drafts, 1):
+                first, second = draft["token1"], draft["token2"]
+                if not first[1] and not second[1]:
+                    continue
+                if not first[1] or not second[1]:
+                    raise ValueError(f"Pair constraint {index}: choose both endpoints before applying.")
+                for chain, target in (first, second):
+                    if chain in ligand_chains and isinstance(target, str) and target.isdigit():
+                        raise ValueError(f"Ligand chain {chain}: enter an atom name such as O1, not a residue number.")
+                    if chain in protein_chains and isinstance(target, int) and target > len(protein_chains[chain]):
+                        raise ValueError(f"Residue {chain},{target} is outside the input protein sequence.")
+                if first == second:
+                    raise ValueError(f"Pair constraint {index}: select two different endpoints.")
+                populated.append(draft)
+            normalized = normalize_distance_constraints(populated)
         except ValueError as exc:
             st.error(str(exc))
         else:
-            st.session_state["distance_constraints"] = normalized
-            applied_constraints = normalized
-            if normalized:
-                st.success(f"Applied {len(normalized)} distance constraint(s).")
-            else:
-                st.success("Applied distance constraints cleared.")
+            applied = normalized
+            st.session_state["distance_constraints"] = applied
+            st.success(f"Applied {len(applied)} pair constraint(s).")
+    st.caption("Edits take effect after Apply. All applied pockets and pairs are used together. Clear removes applied pairs from the next run.")
+    if applied:
+        st.markdown("**Applied pair-distance constraints**")
+        for constraint in applied:
+            first, second = constraint["token1"], constraint["token2"]
+            enforcement = "potential enabled" if constraint.get("force") else "model guidance"
+            st.write(f"{first[0]},{first[1]} ↔ {second[0]},{second[1]} ≤ {constraint['max_distance']:g} Å · {enforcement}")
+    return applied
 
-    if applied_constraints:
-        st.info(f"{len(applied_constraints)} distance constraint(s) are applied to the next screening run.")
-    return applied_constraints
 
 def display_ptm_section(protein_sequence: str = None, default_ptms: Dict = None, protein_sequences: List[Tuple[str, str]] = None) -> Dict:
     """

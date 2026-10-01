@@ -427,33 +427,17 @@ def create_boltz_yaml(workspace_name, design_name, protein_sequence, ligand_smil
 
     # Add constraints if provided and valid
     constraints = []
-    if binding_pocket_constraints and binding_pocket_constraints.get('contacts'):
-        contacts = []
-        for c in binding_pocket_constraints.get('contacts', []):
-            if len(c) >= 2:
-                # Try to cast residue index to int if possible
-                try:
-                    res_idx = int(c[1])
-                except (ValueError, TypeError):
-                    res_idx = c[1]
-                contacts.append([c[0], res_idx])
-        constraints.append({
-            "pocket": {
-                "binder": binding_pocket_constraints.get('binder', 'X'),
-                "contacts": contacts,
-                "max_distance": float(binding_pocket_constraints.get('max_distance', 6.0)),
-                "force": bool(binding_pocket_constraints.get('force', False)),
-            }
-        })
     try:
-        from .drug_screening_input import normalize_distance_constraints
+        from .drug_screening_input import normalize_distance_constraints, binding_pocket_yaml_entries, validate_boltz_constraint_targets
     except ImportError:
-        from drug_screening_input import normalize_distance_constraints
+        from drug_screening_input import normalize_distance_constraints, binding_pocket_yaml_entries, validate_boltz_constraint_targets
+    constraints.extend(binding_pocket_yaml_entries(binding_pocket_constraints))
     constraints.extend(
         {"contact": constraint}
         for constraint in normalize_distance_constraints(distance_constraints)
     )
     if constraints:
+        validate_boltz_constraint_targets(constraints, yaml_content["sequences"])
         yaml_content["constraints"] = constraints
     yaml_content["properties"] = [{"affinity": {"binder": "X"}}]
     with open(filepath, 'w') as f:

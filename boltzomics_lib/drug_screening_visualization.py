@@ -12,6 +12,11 @@ from datetime import datetime
 import re
 
 try:
+    from .drug_screening_input import display_applied_pocket_constraints
+except ImportError:
+    from drug_screening_input import display_applied_pocket_constraints
+
+try:
     from variables import METRIC_DESCRIPTIONS  # type: ignore
     _VARIABLES_IMPORT_ERROR = None
 except Exception as _variables_exc:  # pragma: no cover - optional dependency
@@ -681,21 +686,10 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                     st.markdown(f"**Structural template file**")
                     st.code({template_cif_path})
                 binding_pocket = project_data.get("binding_pocket_constraints")
-                if binding_pocket and isinstance(binding_pocket, dict) and binding_pocket.get('contacts'):
-                    contacts = binding_pocket.get('contacts', [])
-                    max_distance = binding_pocket.get('max_distance', None)
-                    binder = binding_pocket.get('binder', None)
-                    st.markdown("**Binding pocket residues**")
-                    if contacts:
-                        contact_str = ', '.join([f"{c[0]}{c[1]}" for c in contacts])
-                        st.write(f"Residues: {contact_str}")
-                    if binder:
-                        st.write(f"Binder: {binder}")
-                    if max_distance is not None:
-                        st.write(f"Max distance: {max_distance} Å")
+                display_applied_pocket_constraints(binding_pocket)
                 distance_constraints = project_data.get("distance_constraints") or []
                 if distance_constraints:
-                    st.markdown("**Residue/atom distance constraints**")
+                    st.markdown("**Pair-distance constraints**")
                     for constraint in distance_constraints:
                         token1 = constraint.get("token1", ["?", "?"])
                         token2 = constraint.get("token2", ["?", "?"])
@@ -1650,21 +1644,10 @@ def create_visualizations(results: list[dict], structure_only: bool = False):
                 st.code({template_cif_path})
             # Binding pocket
             binding_pocket = project_data.get("binding_pocket_constraints")
-            if binding_pocket and isinstance(binding_pocket, dict) and binding_pocket.get('contacts'):
-                contacts = binding_pocket.get('contacts', [])
-                max_distance = binding_pocket.get('max_distance', None)
-                binder = binding_pocket.get('binder', None)
-                st.markdown("**Binding pocket residues**")
-                if contacts:
-                    contact_str = ', '.join([f"{c[0]}{c[1]}" for c in contacts])
-                    st.write(f"Residues: {contact_str}")
-                if binder:
-                    st.write(f"Binder: {binder}")
-                if max_distance is not None:
-                    st.write(f"Max distance: {max_distance} Å")
+            display_applied_pocket_constraints(binding_pocket)
             distance_constraints = project_data.get("distance_constraints") or []
             if distance_constraints:
-                st.markdown("**Residue/atom distance constraints**")
+                st.markdown("**Pair-distance constraints**")
                 for constraint in distance_constraints:
                     token1 = constraint.get("token1", ["?", "?"])
                     token2 = constraint.get("token2", ["?", "?"])
