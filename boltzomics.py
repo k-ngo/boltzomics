@@ -52,7 +52,7 @@ except ImportError:
     parse_protein_chains = None
 
 try:
-    from screening_job_manager import ScreeningJobManager, ScreeningJob
+    from screening_job_manager import ScreeningJobManager, ScreeningJob, PredictionRetriesExhausted
 except ImportError:
     ScreeningJobManager = None
     ScreeningJob = None
@@ -1167,6 +1167,8 @@ def run_boltz_with_retry(
         enable_msa_cache: If True, cache newly generated MSA files after successful runs.
     """
     last_error = None
+    if affinity_multisampling_enabled and not structure_only and run_affinity_multisampling is None:
+        return None, False, "Affinity multi-sampling is enabled but its runner is unavailable"
     distance_constraints = normalize_distance_constraints(distance_constraints)
     use_potentials = bool(
         use_potentials or any(constraint.get("force", False) for constraint in distance_constraints)
@@ -1415,8 +1417,14 @@ def run_boltz_with_retry(
                         robust_outlier_zmax=affinity_multisampling_robust_outlier_zmax,
                         bootstrap_samples=affinity_multisampling_bootstrap_samples,
                     )
-                if multi_result.success:
-                    results = utils.parse_boltz_results(yaml_filepath, structure_only=structure_only) or results
+                if not multi_result.success:
+                    raise RuntimeError(f"Affinity multi-sampling failed: {multi_result.message}")
+                is_valid, validation_error = validate_boltz_results(yaml_filepath, structure_only=structure_only)
+                if not is_valid:
+                    raise RuntimeError(f"Affinity multi-sampling output invalid: {validation_error}")
+                results = utils.parse_boltz_results(yaml_filepath, structure_only=structure_only)
+                if results is None:
+                    raise RuntimeError("Failed to parse affinity multi-sampling results")
 
             # Cache newly generated MSA so subsequent mutant/drug jobs can reuse it.
             if enable_msa_cache and not current_use_cached_msa:
@@ -2171,7 +2179,9 @@ def _create_failure_result_entry(
         "iptm": None,
         "avg_plddt": None,
         "status": "Failed",
-        "error": (error_message or "Unknown error")[:2000],
+        # The final traceback line usually contains the actual cause. UI previews
+        # may be shortened, but the persisted diagnostic must retain that line.
+        "error": error_message or "Unknown error",
         "workspace": job.workspace_name,
         "design": job.design_name,
         # Keep the replica index so a failed replica is recorded on its own row
@@ -2298,7 +2308,7 @@ def execute_screening_job(job: ScreeningJob, worker_id: int = 0) -> Tuple[Dict[s
         enable_msa_cache=enable_msa_cache,
     )
     if not success or boltz_results is None:
-        raise RuntimeError(error_message or "Boltz prediction failed")
+        raise PredictionRetriesExhausted(error_message or "Boltz prediction failed")
 
     result_entry = _create_result_entry(
         protein_name=job.protein_name,
@@ -4685,10 +4695,10 @@ def main():
         prediction_replicas = int(st.number_input(
             "Prediction Replicas",
             min_value=1,
-            max_value=20,
             value=1,
             step=1,
             help=(
+                "Enter any positive whole number; there is no replica-count cap. "
                 "Independent repeats of every job. Each replica gets its own YAML, its own "
                 "boltz_results folder and its own results row, so replicas never overwrite "
                 "each other. Use more than one to measure run-to-run variability."

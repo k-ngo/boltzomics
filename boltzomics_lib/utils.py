@@ -462,6 +462,17 @@ def create_boltz_yaml(workspace_name, design_name, protein_sequence, ligand_smil
 
     return filepath
 
+def _boltz_timeout_message(label, timeout, exc):
+    """Retain captured diagnostics, including byte output from TimeoutExpired."""
+    message = f"{label} timed out after {timeout} seconds"
+    for stream_name, output in (("stderr", exc.stderr), ("stdout", exc.output)):
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        if output:
+            message += f"\n\n{stream_name}:\n{output}"
+    return message
+
+
 def _run_subprocess_in_process_group(cmd, **kwargs):
     """Run a command and terminate its whole process group on timeout."""
     timeout = kwargs.pop("timeout", None)
@@ -477,33 +488,49 @@ def _run_subprocess_in_process_group(cmd, **kwargs):
         start_new_session=use_process_group,
         **kwargs,
     )
+
+    def signal_process(kill=False):
+        try:
+            if use_process_group:
+                os.killpg(process.pid, signal.SIGKILL if kill else signal.SIGTERM)
+            elif kill:
+                process.kill()
+            else:
+                process.terminate()
+        except ProcessLookupError:
+            pass
+
+    def stop_process_tree():
+        signal_process()
+        try:
+            return process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            signal_process(kill=True)
+            return process.communicate()
+        finally:
+            # communicate() can finish when the leader exits even though a
+            # TERM-resistant child has closed its pipes and kept running.
+            if use_process_group:
+                signal_process(kill=True)
+
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        if use_process_group:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        else:
-            process.terminate()
-        try:
-            stdout, stderr = process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            if use_process_group:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            else:
-                process.kill()
-            stdout, stderr = process.communicate()
+        stdout, stderr = stop_process_tree()
         raise subprocess.TimeoutExpired(
             cmd=cmd,
             timeout=timeout,
             output=stdout if stdout is not None else exc.output,
             stderr=stderr if stderr is not None else exc.stderr,
         ) from exc
+    except BaseException:
+        # Interrupting the CLI must not leave GPU work running in the background.
+        stop_process_tree()
+        raise
+    if use_process_group:
+        # A completed leader must not leave background workers consuming GPU
+        # resources, including after an early command failure.
+        signal_process(kill=True)
     return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
 
 
@@ -687,8 +714,8 @@ def run_boltz_prediction(
         if "Failed to process" in combined_output and "Skipping" in combined_output:
             raise Exception("Boltz reported input processing failure. Check MSA/template/constraint paths.")
         return result.stdout
-    except subprocess.TimeoutExpired:
-        raise Exception(f"Boltz prediction timed out after {timeout or 300} seconds")
+    except subprocess.TimeoutExpired as exc:
+        raise Exception(_boltz_timeout_message("Boltz prediction", timeout or 300, exc)) from exc
     except Exception as e:
         raise Exception(f"Error running Boltz prediction: {str(e)}")
 
@@ -827,8 +854,8 @@ def run_boltz_batch_prediction(
         if "Failed to process" in combined_output and "Skipping" in combined_output:
             raise Exception("Boltz reported batch input processing failure. Check MSA/template/constraint paths.")
         return result.stdout
-    except subprocess.TimeoutExpired:
-        raise Exception(f"Boltz batch prediction timed out after {timeout or 1800} seconds")
+    except subprocess.TimeoutExpired as exc:
+        raise Exception(_boltz_timeout_message("Boltz batch prediction", timeout or 1800, exc)) from exc
     except Exception as e:
         raise Exception(f"Error running Boltz batch prediction: {str(e)}")
 

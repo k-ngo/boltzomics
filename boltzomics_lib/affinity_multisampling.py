@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -185,8 +186,22 @@ def _read_json(path: Path) -> Dict[str, Any]:
 
 
 def _write_json(path: Path, data: Dict[str, Any]) -> None:
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
+    # Replace only after serialization and flush succeed, leaving the previous
+    # complete result readable if the sweep is interrupted during a write.
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.",
+            suffix=".tmp", delete=False,
+        ) as f:
+            temporary_path = Path(f.name)
+            json.dump(data, f, indent=4, allow_nan=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -199,6 +214,17 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
     except (TypeError, ValueError):
         return None
+
+
+def _validate_affinity_result(data: Dict[str, Any], label: str) -> None:
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid affinity result for {label}: expected a JSON object")
+    for key in ("affinity_pred_value", "affinity_probability_binary"):
+        value = _safe_float(data.get(key))
+        if isinstance(data.get(key), bool) or value is None:
+            raise ValueError(f"Invalid affinity result for {label}: missing or non-finite {key}")
+        if key == "affinity_probability_binary" and not 0.0 <= value <= 1.0:
+            raise ValueError(f"Invalid affinity result for {label}: {key} outside [0, 1]")
 
 
 def _aggregate(values: np.ndarray, mode: str, weights: Optional[np.ndarray] = None) -> float:
@@ -312,10 +338,11 @@ def _can_use_inprocess_sweep(yaml_path: Path, use_cached_msa: bool, devices: int
         return False
     if not bool(use_cached_msa):
         return False
-    flag = str(os.getenv("BOLTZOMICS_MULTISAMPLING_INPROCESS", "1")).strip().lower()
-    if flag in {"0", "false", "no", "off"}:
-        return False
-    return True
+    # Keep model/CUDA state out of the persistent queue worker by default.
+    # The experimental in-process path does not enforce timeout or honor the
+    # job's CUDA_VISIBLE_DEVICES assignment; subprocess runs do both.
+    flag = str(os.getenv("BOLTZOMICS_MULTISAMPLING_INPROCESS", "0")).strip().lower()
+    return flag in {"1", "true", "yes", "on"}
 
 
 def _run_affinity_sweep_inprocess(
@@ -782,7 +809,9 @@ def run_affinity_multisampling(
         )
         if not affinity_path.exists():
             raise FileNotFoundError(f"Missing affinity output after rerun: {affinity_path}")
-        return _read_json(affinity_path)
+        data = _read_json(affinity_path)
+        _validate_affinity_result(data, _profile_label(sampling_steps_affinity, diffusion_samples_affinity))
+        return data
 
     if not affinity_path.exists():
         return MultiSamplingResult(
@@ -815,6 +844,7 @@ def run_affinity_multisampling(
             pass
 
     base_data = _read_json(affinity_path)
+    _validate_affinity_result(base_data, "baseline")
     initial_steps = int(base_data.get("sampling_steps_affinity", 0) or 0)
     initial_diff = int(base_data.get("diffusion_samples_affinity", 0) or 0)
     current_label: Optional[str] = None
@@ -1022,6 +1052,9 @@ def run_affinity_multisampling(
                         str(item["label"]) for item in sweep_profiles[idx + 1 :]
                     ]
                     break
+
+    for label, data in per_setting.items():
+        _validate_affinity_result(data, label)
 
     setting_values_map = {
         label: _safe_float((per_setting.get(label) or {}).get("affinity_pred_value"))

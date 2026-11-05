@@ -9,6 +9,10 @@ from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Callable
 
 
+class PredictionRetriesExhausted(RuntimeError):
+    """The prediction runner has already consumed its configured retry budget."""
+
+
 @dataclass
 class ScreeningJob:
     """Represents a single screening prediction job."""
@@ -476,7 +480,10 @@ class ScreeningJobManager:
         with self.lock:
             job.retries += 1
             job.error = error_text
-            attempts_remaining = job.retries < max(1, int(job.max_attempts or 1))
+            attempts_remaining = (
+                not isinstance(exc, PredictionRetriesExhausted)
+                and job.retries < max(1, int(job.max_attempts or 1))
+            )
             if attempts_remaining:
                 # Back off so a systemic problem (out of memory, missing model
                 # weights) does not spin the queue at full speed.
@@ -559,4 +566,4 @@ class ScreeningJobManager:
         os.replace(tmp_path, self.state_path)
 
 
-__all__ = ["ScreeningJob", "ScreeningJobManager"]
+__all__ = ["ScreeningJob", "ScreeningJobManager", "PredictionRetriesExhausted"]
